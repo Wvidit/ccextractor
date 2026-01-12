@@ -30,7 +30,7 @@ ccx_encoders_transcript_format ccx_encoders_default_transcript_settings =
 	.useColors = 1,
 	.isFinal = 0};
 
-// TODO sami header doesn't carry about CRLF/LF option
+// TODO sami header doesn't care about CRLF/LF option
 static const char *sami_header = // TODO: Revise the <!-- comments
     "<SAMI>\n\
 <HEAD>\n\
@@ -131,7 +131,7 @@ int write_subtitle_file_footer(struct encoder_ctx *ctx, struct ccx_s_write *out)
 	switch (ctx->write_format)
 	{
 		case CCX_OF_SAMI:
-			sprintf((char *)str, "</BODY></SAMI>\n");
+			snprintf((char *)str, sizeof(str), "</BODY></SAMI>\n");
 			if (ctx->encoding != CCX_ENC_UNICODE)
 			{
 				dbg_print(CCX_DMT_DECODER_608, "\r%s\n", str);
@@ -144,7 +144,7 @@ int write_subtitle_file_footer(struct encoder_ctx *ctx, struct ccx_s_write *out)
 			}
 			break;
 		case CCX_OF_SMPTETT:
-			sprintf((char *)str, "    </div>\n  </body>\n</tt>\n");
+			snprintf((char *)str, sizeof(str), "    </div>\n  </body>\n</tt>\n");
 			if (ctx->encoding != CCX_ENC_UNICODE)
 			{
 				dbg_print(CCX_DMT_DECODER_608, "\r%s\n", str);
@@ -160,7 +160,7 @@ int write_subtitle_file_footer(struct encoder_ctx *ctx, struct ccx_s_write *out)
 			write_spumux_footer(out);
 			break;
 		case CCX_OF_SIMPLE_XML:
-			sprintf((char *)str, "</captions>\n");
+			snprintf((char *)str, sizeof(str), "</captions>\n");
 			if (ctx->encoding != CCX_ENC_UNICODE)
 			{
 				dbg_print(CCX_DMT_DECODER_608, "\r%s\n", str);
@@ -193,7 +193,7 @@ static int write_bom(struct encoder_ctx *ctx, struct ccx_s_write *out)
 			ret = write(out->fh, UTF8_BOM, sizeof(UTF8_BOM));
 			if (ret < sizeof(UTF8_BOM))
 			{
-				mprint("WARNING: Unable tp write UTF BOM\n");
+				mprint("WARNING: Unable to write UTF BOM\n");
 				return -1;
 			}
 		}
@@ -667,8 +667,13 @@ static int init_output_ctx(struct encoder_ctx *ctx, struct encoder_cfg *cfg)
 
 			if (cfg->cc_to_stdout)
 			{
+#ifdef WIN32
+				ctx->dtvcc_writers[i].fd = -1;
+				ctx->dtvcc_writers[i].fhandle = GetStdHandle(STD_OUTPUT_HANDLE);
+#else
 				ctx->dtvcc_writers[i].fd = STDOUT_FILENO;
 				ctx->dtvcc_writers[i].fhandle = NULL;
+#endif
 				ctx->dtvcc_writers[i].charset = NULL;
 				ctx->dtvcc_writers[i].filename = NULL;
 				ctx->dtvcc_writers[i].cd = (iconv_t)-1;
@@ -713,6 +718,9 @@ void dinit_encoder(struct encoder_ctx **arg, LLONG current_fts)
 			try_to_add_end_credits(ctx, ctx->out + i, current_fts);
 		write_subtitle_file_footer(ctx, ctx->out + i);
 	}
+
+	// Clean up teletext multi-page output files (issue #665)
+	dinit_teletext_outputs(ctx);
 
 	free_encoder_context(ctx->prev);
 	dinit_output_ctx(ctx);
@@ -767,6 +775,7 @@ struct encoder_ctx *init_encoder(struct encoder_cfg *opt)
 		return NULL;
 	}
 	ctx->in_fileformat = opt->in_format;
+	ctx->is_pal = (opt->in_format == 2);
 
 	/** used in case of SUB_EOD_MARKER */
 	ctx->prev_start = -1;
@@ -832,6 +841,19 @@ struct encoder_ctx *init_encoder(struct encoder_cfg *opt)
 	ctx->segment_pending = 0;
 	ctx->segment_last_key_frame = 0;
 	ctx->nospupngocr = opt->nospupngocr;
+	ctx->scc_framerate = opt->scc_framerate;
+	ctx->scc_accurate_timing = opt->scc_accurate_timing;
+	ctx->scc_last_transmission_end = 0;
+	ctx->scc_last_display_end = 0;
+
+	// Initialize teletext multi-page output arrays (issue #665)
+	ctx->tlt_out_count = 0;
+	for (int i = 0; i < MAX_TLT_PAGES_EXTRACT; i++)
+	{
+		ctx->tlt_out[i] = NULL;
+		ctx->tlt_out_pages[i] = 0;
+		ctx->tlt_srt_counter[i] = 0;
+	}
 
 	ctx->prev = NULL;
 	return ctx;
@@ -867,8 +889,30 @@ int encode_sub(struct encoder_ctx *context, struct cc_subtitle *sub)
 	int wrote_something = 0;
 	int ret = 0;
 
+	/* If there is no encoder context (e.g. -out=report), we must still free
+	   any allocated subtitle data to avoid memory leaks. */
 	if (!context)
+	{
+		if (sub)
+		{
+			/* DVB subtitles store bitmap planes inside cc_bitmap */
+			if (sub->datatype == CC_DATATYPE_DVB)
+			{
+				struct cc_bitmap *bitmap = (struct cc_bitmap *)sub->data;
+				if (bitmap)
+				{
+					freep(&bitmap->data0);
+					freep(&bitmap->data1);
+				}
+			}
+
+			/* Free generic subtitle payload buffer */
+			freep(&sub->data);
+			sub->nb_data = 0;
+		}
+
 		return CCX_OK;
+	}
 
 	context = change_filename(context);
 
@@ -902,6 +946,11 @@ int encode_sub(struct encoder_ctx *context, struct cc_subtitle *sub)
 				// After adding delay, if start/end time is lower than 0, then continue with the next subtitle
 				if (data->start_time < 0 || data->end_time <= 0)
 				{
+					// Free XDS string if skipping to avoid memory leak
+					if (data->format == SFORMAT_XDS && data->xds_str)
+					{
+						freep(&data->xds_str);
+					}
 					continue;
 				}
 
@@ -1001,6 +1050,28 @@ int encode_sub(struct encoder_ctx *context, struct cc_subtitle *sub)
 			freep(&sub->data);
 			break;
 		case CC_BITMAP:;
+			// Apply subs_delay to bitmap subtitles (DVB, DVD, etc.)
+			// This is the same as what's done for CC_608 above
+			sub->start_time += context->subs_delay;
+			sub->end_time += context->subs_delay;
+
+			// After adding delay, if start/end time is lower than 0, skip this subtitle
+			if (sub->start_time < 0 || sub->end_time <= 0)
+			{
+				// Free bitmap data to avoid memory leak
+				if (sub->datatype == CC_DATATYPE_DVB)
+				{
+					struct cc_bitmap *bitmap_tmp = (struct cc_bitmap *)sub->data;
+					if (bitmap_tmp)
+					{
+						freep(&bitmap_tmp->data0);
+						freep(&bitmap_tmp->data1);
+					}
+				}
+				freep(&sub->data);
+				sub->nb_data = 0;
+				break;
+			}
 
 #ifdef ENABLE_OCR
 			struct cc_bitmap *rect;
@@ -1181,7 +1252,7 @@ unsigned int get_line_encoded(struct encoder_ctx *ctx, unsigned char *buffer, in
 {
 	unsigned char *orig = buffer; // Keep for debugging
 	unsigned char *line = data->characters[line_num];
-	for (int i = 0; i < 33; i++)
+	for (int i = 0; i < 32; i++)
 	{
 		int bytes = 0;
 		switch (ctx->encoding)
@@ -1215,7 +1286,6 @@ unsigned int get_color_encoded(struct encoder_ctx *ctx, unsigned char *buffer, i
 		else
 			*buffer++ = 'E';
 	}
-	*buffer = 0;
 	return (unsigned)(buffer - orig); // Return length
 }
 unsigned int get_font_encoded(struct encoder_ctx *ctx, unsigned char *buffer, int line_num, struct eia608_screen *data)
@@ -1252,7 +1322,7 @@ void switch_output_file(struct lib_ccx_ctx *ctx, struct encoder_ctx *enc_ctx, in
 	}
 	const char *ext = get_file_extension(ctx->write_format);
 	char suffix[32];
-	sprintf(suffix, "_%d", track_id);
+	snprintf(suffix, sizeof(suffix), "_%d", track_id);
 	char *basename = get_basename(enc_ctx->out->original_filename);
 	if (basename != NULL)
 	{
@@ -1266,4 +1336,169 @@ void switch_output_file(struct lib_ccx_ctx *ctx, struct encoder_ctx *enc_ctx, in
 	// Reset counters as we switch output file.
 	enc_ctx->cea_708_counter = 0;
 	enc_ctx->srt_counter = 0;
+}
+
+/**
+ * Get or create the output file for a specific teletext page (issue #665)
+ * Creates output files on-demand with suffix _pNNN (e.g., output_p891.srt)
+ * Returns NULL if we're in stdout mode or if too many pages are being extracted
+ */
+struct ccx_s_write *get_teletext_output(struct encoder_ctx *ctx, uint16_t teletext_page)
+{
+	// If teletext_page is 0, use the default output
+	if (teletext_page == 0 || ctx->out == NULL)
+		return ctx->out;
+
+	// Check if we're sending to stdout - can't do multi-page in that case
+	if (ctx->out[0].fh == STDOUT_FILENO)
+		return ctx->out;
+
+	// Check if we already have an output file for this page
+	for (int i = 0; i < ctx->tlt_out_count; i++)
+	{
+		if (ctx->tlt_out_pages[i] == teletext_page)
+			return ctx->tlt_out[i];
+	}
+
+	// If we only have one teletext page requested, use the default output
+	// (no suffix needed for backward compatibility)
+	extern struct ccx_s_teletext_config tlt_config;
+	if (tlt_config.num_user_pages <= 1 && !tlt_config.extract_all_pages)
+		return ctx->out;
+
+	// Need to create a new output file for this page
+	if (ctx->tlt_out_count >= MAX_TLT_PAGES_EXTRACT)
+	{
+		mprint("Warning: Too many teletext pages to extract (max %d), using default output for page %03d\n",
+		       MAX_TLT_PAGES_EXTRACT, teletext_page);
+		return ctx->out;
+	}
+
+	// Allocate the new write structure
+	struct ccx_s_write *new_out = (struct ccx_s_write *)malloc(sizeof(struct ccx_s_write));
+	if (!new_out)
+	{
+		mprint("Error: Memory allocation failed for teletext output\n");
+		return ctx->out;
+	}
+	memset(new_out, 0, sizeof(struct ccx_s_write));
+
+	// Create the filename with page suffix
+	const char *ext = get_file_extension(ctx->write_format);
+	char suffix[16];
+	snprintf(suffix, sizeof(suffix), "_p%03d", teletext_page);
+
+	char *basefilename = NULL;
+	if (ctx->out[0].filename != NULL)
+	{
+		basefilename = get_basename(ctx->out[0].filename);
+	}
+	else if (ctx->first_input_file != NULL)
+	{
+		basefilename = get_basename(ctx->first_input_file);
+	}
+	else
+	{
+		basefilename = strdup("untitled");
+	}
+
+	if (basefilename == NULL)
+	{
+		free(new_out);
+		return ctx->out;
+	}
+
+	char *filename = create_outfilename(basefilename, suffix, ext);
+	free(basefilename);
+
+	if (filename == NULL)
+	{
+		free(new_out);
+		return ctx->out;
+	}
+
+	// Open the file
+	new_out->filename = filename;
+	new_out->fh = open(filename, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, S_IREAD | S_IWRITE);
+	if (new_out->fh == -1)
+	{
+		mprint("Error: Failed to open output file %s: %s\n", filename, strerror(errno));
+		free(filename);
+		free(new_out);
+		return ctx->out;
+	}
+
+	mprint("Creating teletext output file: %s\n", filename);
+
+	// Store in our array
+	int idx = ctx->tlt_out_count;
+	ctx->tlt_out[idx] = new_out;
+	ctx->tlt_out_pages[idx] = teletext_page;
+	ctx->tlt_srt_counter[idx] = 0;
+	ctx->tlt_out_count++;
+
+	// Write the subtitle file header
+	write_subtitle_file_header(ctx, new_out);
+
+	return new_out;
+}
+
+/**
+ * Get the SRT counter for a specific teletext page (issue #665)
+ * Returns pointer to the counter, or NULL if page not found
+ */
+unsigned int *get_teletext_srt_counter(struct encoder_ctx *ctx, uint16_t teletext_page)
+{
+	// If teletext_page is 0, use the default counter
+	if (teletext_page == 0)
+		return &ctx->srt_counter;
+
+	// Check if we're using multi-page mode
+	extern struct ccx_s_teletext_config tlt_config;
+	if (tlt_config.num_user_pages <= 1 && !tlt_config.extract_all_pages)
+		return &ctx->srt_counter;
+
+	// Find the counter for this page
+	for (int i = 0; i < ctx->tlt_out_count; i++)
+	{
+		if (ctx->tlt_out_pages[i] == teletext_page)
+			return &ctx->tlt_srt_counter[i];
+	}
+
+	// Not found, use default counter
+	return &ctx->srt_counter;
+}
+
+/**
+ * Clean up all teletext output files (issue #665)
+ */
+void dinit_teletext_outputs(struct encoder_ctx *ctx)
+{
+	if (!ctx)
+		return;
+
+	for (int i = 0; i < ctx->tlt_out_count; i++)
+	{
+		if (ctx->tlt_out[i] != NULL)
+		{
+			// Write footer
+			write_subtitle_file_footer(ctx, ctx->tlt_out[i]);
+
+			// Close file
+			if (ctx->tlt_out[i]->fh != -1)
+			{
+				close(ctx->tlt_out[i]->fh);
+			}
+
+			// Free filename
+			if (ctx->tlt_out[i]->filename != NULL)
+			{
+				free(ctx->tlt_out[i]->filename);
+			}
+
+			free(ctx->tlt_out[i]);
+			ctx->tlt_out[i] = NULL;
+		}
+	}
+	ctx->tlt_out_count = 0;
 }

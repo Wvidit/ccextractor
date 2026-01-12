@@ -66,8 +66,8 @@ pub const UTF8_BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 pub const DVD_HEADER: [u8; 8] = [0x00, 0x00, 0x01, 0xb2, 0x43, 0x43, 0x01, 0xf8];
 pub const LC1: [u8; 1] = [0x8a];
 pub const LC2: [u8; 1] = [0x8f];
-pub const LC3: [u8; 2] = [0x16, 0xfe];
-pub const LC4: [u8; 2] = [0x1e, 0xfe];
+pub const LC3: [u8; 1] = [0x16]; // McPoodle uses single-byte loop markers
+pub const LC4: [u8; 1] = [0x1e];
 pub const LC5: [u8; 1] = [0xff];
 pub const LC6: [u8; 1] = [0xfe];
 
@@ -147,7 +147,11 @@ pub const CCX_DECODER_608_SCREEN_WIDTH: usize = 32;
 pub const ONEPASS: usize = 120; // Bytes we can always look ahead without going out of limits
 pub const BUFSIZE: usize = 2048 * 1024 + ONEPASS; // 2 Mb plus the safety pass
 pub const MAX_CLOSED_CAPTION_DATA_PER_PICTURE: usize = 32;
-pub const EIA_708_BUFFER_LENGTH: usize = 2048; // TODO: Find out what the real limit is
+/// CEA-708 Service Input Buffer size.
+/// Specification minimum is 128 bytes per service, but we use 2048 bytes
+/// (16x the minimum) to provide a safety margin for buffer management.
+/// Reference: CEA-708-E Section 8.4.3 - Service Input Buffers
+pub const EIA_708_BUFFER_LENGTH: usize = 2048;
 pub const TS_PACKET_PAYLOAD_LENGTH: usize = 184; // From specs
 pub const SUBLINESIZE: usize = 2048; // Max. length of a .srt line - TODO: Get rid of this
 pub const STARTBYTESLENGTH: usize = 1024 * 1024;
@@ -247,6 +251,17 @@ pub enum DataSource {
     Network,
     Tcp,
 }
+impl From<u32> for DataSource {
+    fn from(value: u32) -> Self {
+        match value {
+            0 => DataSource::File,
+            1 => DataSource::Stdin,
+            2 => DataSource::Network,
+            3 => DataSource::Tcp,
+            _ => DataSource::File, // Default or fallback case
+        }
+    }
+}
 
 #[derive(Default, Debug, PartialEq, Eq, Clone, Copy)]
 pub enum StreamMode {
@@ -267,9 +282,10 @@ pub enum StreamMode {
     Gxf = 11,
     Mkv = 12,
     Mxf = 13,
+    Scc = 14, // Scenarist Closed Caption input
     Autodetect = 16,
 }
-
+#[derive(Debug, Eq, Clone, Copy)]
 pub enum BufferdataType {
     Unknown,
     Pes,
@@ -327,7 +343,7 @@ pub enum CcxTxt {
 }
 
 #[derive(Debug, Default, EnumString, Clone, Copy, PartialEq, Eq)]
-#[strum(serialize_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum Language {
     #[default]
     Und, // Undefined
@@ -626,5 +642,10 @@ impl Language {
             Language::Vie => "vie",
             Language::Yid => "yid",
         }
+    }
+}
+impl PartialEq for BufferdataType {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
     }
 }

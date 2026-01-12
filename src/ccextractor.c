@@ -2,6 +2,8 @@
 /* CCExtractor, originally by carlos at ccextractor.org, now a lot of people.
 Credits: See AUTHORS.TXT
 License: GPL 2.0
+
+CI verification run: 2025-12-19T08:30 - Testing merged fixes from PRs #1847 and #1848
 */
 #include "ccextractor.h"
 #include <stdio.h>
@@ -184,6 +186,11 @@ int start_ccx()
 					ccx_options.use_gop_as_pts = 0;
 				if (ccx_options.ignore_pts_jumps)
 					ccx_common_timing_settings.disable_sync_check = 1;
+				// When using GOP timing (--goptime), disable sync check because
+				// GOP time (wall-clock) and PES PTS (stream-relative) are in
+				// different time bases and will always appear as huge jumps.
+				if (ccx_options.use_gop_as_pts == 1)
+					ccx_common_timing_settings.disable_sync_check = 1;
 				mprint("\rAnalyzing data in general mode\n");
 				tmp = general_loop(ctx);
 				if (!ret)
@@ -191,6 +198,12 @@ int start_ccx()
 				break;
 			case CCX_SM_MCPOODLESRAW:
 				mprint("\rAnalyzing data in McPoodle raw mode\n");
+				tmp = raw_loop(ctx);
+				if (!ret)
+					ret = tmp;
+				break;
+			case CCX_SM_SCC:
+				mprint("\rAnalyzing data in SCC (Scenarist Closed Caption) mode\n");
 				tmp = raw_loop(ctx);
 				if (!ret)
 					ret = tmp;
@@ -421,6 +434,9 @@ int main(int argc, char *argv[])
 	ccxr_init_basic_logger();
 
 	int compile_ret = ccxr_parse_parameters(argc, argv);
+
+	// Update the Rust logger target after parsing so --quiet is respected
+	ccxr_update_logger_target();
 
 	if (compile_ret == EXIT_NO_INPUT_FILES)
 	{

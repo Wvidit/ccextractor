@@ -8,6 +8,11 @@
 #include <dirent.h>
 #include "ccx_encoders_helpers.h"
 #include "ccx_encoders_spupng.h"
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #include "ocr.h"
 
 struct ocrCtx
@@ -50,8 +55,24 @@ static int search_language_pack(const char *dir_name, const char *lang_name)
 
 	// Search for a tessdata folder in the specified directory
 	char *dirname = strdup(dir_name);
-	dirname = realloc(dirname, strlen(dirname) + strlen("tessdata/") + 1);
-	strcat(dirname, "tessdata/");
+	if (!dirname)
+	{
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In search_language_pack: Out of memory allocating dirname.");
+	}
+
+	size_t dirname_len = strlen(dirname);
+	int need_slash = (dirname[dirname_len - 1] != '/');
+	size_t new_size = dirname_len + strlen("tessdata/") + need_slash + 1;
+	char *new_dirname = realloc(dirname, new_size);
+	if (!new_dirname)
+	{
+		free(dirname);
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In search_language_pack: Out of memory reallocating dirname.");
+	}
+	dirname = new_dirname;
+
+	// Append "/" if needed and "tessdata/" using snprintf
+	snprintf(dirname + dirname_len, new_size - dirname_len, "%stessdata/", need_slash ? "/" : "");
 
 	DIR *dp;
 	struct dirent *dirp;
@@ -85,14 +106,78 @@ void delete_ocr(void **arg)
 }
 
 /**
+ * get_executable_directory
+ *
+ * Returns the directory containing the executable.
+ * Returns a pointer to a static buffer, or NULL on failure.
+ */
+static const char *get_executable_directory(void)
+{
+	static char exe_dir[1024] = {0};
+	static int initialized = 0;
+
+	if (initialized)
+		return exe_dir[0] ? exe_dir : NULL;
+
+	initialized = 1;
+
+#ifdef _WIN32
+	char exe_path[MAX_PATH];
+	DWORD len = GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+	if (len == 0 || len >= MAX_PATH)
+		return NULL;
+
+	// Find the last backslash and truncate there
+	char *last_sep = strrchr(exe_path, '\\');
+	if (last_sep)
+	{
+		*last_sep = '\0';
+		strncpy(exe_dir, exe_path, sizeof(exe_dir) - 1);
+		exe_dir[sizeof(exe_dir) - 1] = '\0';
+	}
+#elif defined(__linux__)
+	char exe_path[1024];
+	ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+	if (len <= 0)
+		return NULL;
+	exe_path[len] = '\0';
+
+	char *last_sep = strrchr(exe_path, '/');
+	if (last_sep)
+	{
+		*last_sep = '\0';
+		strncpy(exe_dir, exe_path, sizeof(exe_dir) - 1);
+		exe_dir[sizeof(exe_dir) - 1] = '\0';
+	}
+#elif defined(__APPLE__)
+	char exe_path[1024];
+	uint32_t size = sizeof(exe_path);
+	if (_NSGetExecutablePath(exe_path, &size) != 0)
+		return NULL;
+
+	char *last_sep = strrchr(exe_path, '/');
+	if (last_sep)
+	{
+		*last_sep = '\0';
+		strncpy(exe_dir, exe_path, sizeof(exe_dir) - 1);
+		exe_dir[sizeof(exe_dir) - 1] = '\0';
+	}
+#endif
+
+	return exe_dir[0] ? exe_dir : NULL;
+}
+
+/**
  * probe_tessdata_location
  *
  * This function probe tesseract data location
  *
  * Priority of Tesseract traineddata file search paths:-
  * 1. tessdata in TESSDATA_PREFIX, if it is specified. Overrides others
- * 2. tessdata in current working directory
- * 3. tessdata in /usr/share
+ * 2. tessdata in executable directory (for bundled tessdata)
+ * 3. tessdata in current working directory
+ * 4. tessdata in system locations (/usr/share, etc.)
+ * 5. tessdata in default Tesseract install location (Windows)
  */
 char *probe_tessdata_location(const char *lang)
 {
@@ -100,6 +185,7 @@ char *probe_tessdata_location(const char *lang)
 
 	const char *paths[] = {
 	    getenv("TESSDATA_PREFIX"),
+	    get_executable_directory(),
 	    "./",
 	    "/usr/share/",
 	    "/usr/local/share/",
@@ -145,6 +231,7 @@ void *init_ocr(int lang_index)
 		if (lang_index == 1)
 		{
 			mprint("eng.traineddata not found! No Switching Possible\n");
+			free(ctx);
 			return NULL;
 		}
 		mprint("%s.traineddata not found! Switching to English\n", lang);
@@ -154,12 +241,24 @@ void *init_ocr(int lang_index)
 		if (!tessdata_path)
 		{
 			mprint("eng.traineddata not found! No Switching Possible\n");
+			free(ctx);
 			return NULL;
 		}
 	}
 
 	char *pars_vec = strdup("debug_file");
+	if (!pars_vec)
+	{
+		free(ctx);
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In init_ocr: Out of memory allocating pars_vec.");
+	}
 	char *pars_values = strdup("tess.log");
+	if (!pars_values)
+	{
+		free(pars_vec);
+		free(ctx);
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In init_ocr: Out of memory allocating pars_values.");
+	}
 
 	ctx->api = TessBaseAPICreate();
 	if (!strncmp("4.", TessVersion(), 2) || !strncmp("5.", TessVersion(), 2))
@@ -181,6 +280,13 @@ void *init_ocr(int lang_index)
 
 	// set PSM mode
 	TessBaseAPISetPageSegMode(ctx->api, ccx_options.psm);
+
+	// Set character blacklist to prevent common OCR errors (e.g. | vs I)
+	// These characters are rarely used in subtitles but often misrecognized
+	if (ccx_options.ocr_blacklist)
+	{
+		TessBaseAPISetVariable(ctx->api, "tessedit_char_blacklist", "|\\`_~");
+	}
 
 	free(pars_vec);
 	free(pars_values);
@@ -206,32 +312,220 @@ fail:
  */
 BOX *ignore_alpha_at_edge(png_byte *alpha, unsigned char *indata, int w, int h, PIX *in, PIX **out)
 {
-	int i, j, index, start_y = 0, end_y = 0;
-	int find_end_x = CCX_FALSE;
+	int i, j, index, start_x = -1, end_x = -1;
 	BOX *cropWindow;
-	for (j = 1; j < w - 1; j++)
+
+	// Find the leftmost and rightmost columns with visible (non-transparent) pixels
+	for (j = 0; j < w; j++)
 	{
 		for (i = 0; i < h; i++)
 		{
-			index = indata[i * w + (j)];
+			index = indata[i * w + j];
 			if (alpha[index] != 0)
 			{
-				if (find_end_x == CCX_FALSE)
+				if (start_x < 0)
+					start_x = j;
+				end_x = j;
+				break; // Found visible pixel in this column, move to next
+			}
+		}
+	}
+
+	// Handle edge cases: no visible pixels or invalid dimensions
+	if (start_x < 0 || end_x < start_x || w <= 0 || h <= 0)
+	{
+		// Return the entire image as fallback
+		cropWindow = boxCreate(0, 0, w, h);
+		*out = pixClone(in);
+		return cropWindow;
+	}
+
+	int crop_width = end_x - start_x + 1;
+	if (crop_width <= 0)
+		crop_width = w;
+
+	cropWindow = boxCreate(start_x, 0, crop_width, h);
+	*out = pixClipRectangle(in, cropWindow, NULL);
+
+	// If clipping failed, return the original image
+	if (*out == NULL)
+	{
+		boxDestroy(&cropWindow);
+		cropWindow = boxCreate(0, 0, w, h);
+		*out = pixClone(in);
+	}
+
+	return cropWindow;
+}
+
+/**
+ * Structure to hold the vertical boundaries of a detected text line.
+ */
+struct line_bounds
+{
+	int start_y; // Top row of line (inclusive)
+	int end_y;   // Bottom row of line (inclusive)
+};
+
+/**
+ * Detects horizontal text line boundaries in a bitmap by finding rows of
+ * fully transparent pixels that separate lines of text.
+ *
+ * @param alpha     Palette alpha values (indexed by pixel value)
+ * @param indata    Bitmap pixel data (palette indices, w*h bytes)
+ * @param w         Image width
+ * @param h         Image height
+ * @param lines     Output: allocated array of line boundaries (caller must free)
+ * @param num_lines Output: number of lines found
+ * @param min_gap   Minimum consecutive transparent rows to count as line separator
+ * @return 0 on success, -1 on failure
+ */
+static int detect_text_lines(png_byte *alpha, unsigned char *indata,
+			     int w, int h,
+			     struct line_bounds **lines, int *num_lines,
+			     int min_gap)
+{
+	if (!alpha || !indata || !lines || !num_lines || w <= 0 || h <= 0)
+		return -1;
+
+	*lines = NULL;
+	*num_lines = 0;
+
+	// Allocate array to track which rows have visible content
+	int *row_has_content = (int *)malloc(h * sizeof(int));
+	if (!row_has_content)
+		return -1;
+
+	// Scan each row to determine if it has any visible (non-transparent) pixels
+	for (int i = 0; i < h; i++)
+	{
+		row_has_content[i] = 0;
+		for (int j = 0; j < w; j++)
+		{
+			int index = indata[i * w + j];
+			if (alpha[index] != 0)
+			{
+				row_has_content[i] = 1;
+				break; // Found visible pixel, no need to check rest of row
+			}
+		}
+	}
+
+	// Count lines by finding runs of content rows separated by gaps
+	int max_lines = (h / 2) + 1; // Conservative upper bound
+	struct line_bounds *temp_lines = (struct line_bounds *)malloc(max_lines * sizeof(struct line_bounds));
+	if (!temp_lines)
+	{
+		free(row_has_content);
+		return -1;
+	}
+
+	int line_count = 0;
+	int in_line = 0;
+	int line_start = 0;
+	int gap_count = 0;
+
+	for (int i = 0; i < h; i++)
+	{
+		if (row_has_content[i])
+		{
+			if (!in_line)
+			{
+				// Start of a new line
+				line_start = i;
+				in_line = 1;
+			}
+			gap_count = 0;
+		}
+		else
+		{
+			if (in_line)
+			{
+				gap_count++;
+				if (gap_count >= min_gap)
 				{
-					start_y = j;
-					find_end_x = CCX_TRUE;
-				}
-				else
-				{
-					end_y = j;
+					// End of line found (gap is large enough)
+					if (line_count < max_lines)
+					{
+						temp_lines[line_count].start_y = line_start;
+						temp_lines[line_count].end_y = i - gap_count;
+						line_count++;
+					}
+					in_line = 0;
+					gap_count = 0;
 				}
 			}
 		}
 	}
-	cropWindow = boxCreate(start_y, 0, (w - (start_y + (w - end_y))), h - 1);
-	*out = pixClipRectangle(in, cropWindow, NULL);
 
-	return cropWindow;
+	// Handle last line if we ended while still in a line
+	if (in_line && line_count < max_lines)
+	{
+		temp_lines[line_count].start_y = line_start;
+		// Find the last row with content
+		int last_content = h - 1;
+		while (last_content > line_start && !row_has_content[last_content])
+			last_content--;
+		temp_lines[line_count].end_y = last_content;
+		line_count++;
+	}
+
+	free(row_has_content);
+
+	if (line_count == 0)
+	{
+		free(temp_lines);
+		return -1;
+	}
+
+	// Shrink allocation to actual size
+	*lines = (struct line_bounds *)realloc(temp_lines, line_count * sizeof(struct line_bounds));
+	if (!*lines)
+	{
+		*lines = temp_lines; // Keep original if realloc fails
+	}
+	*num_lines = line_count;
+
+	return 0;
+}
+
+/**
+ * Performs OCR on a single text line image using PSM 7 (single line mode).
+ *
+ * @param ctx      OCR context (contains Tesseract API)
+ * @param line_pix Pre-processed PIX for single line (grayscale, inverted)
+ * @return Recognized text (caller must free with free()), or NULL on failure
+ */
+static char *ocr_single_line(struct ocrCtx *ctx, PIX *line_pix)
+{
+	if (!ctx || !ctx->api || !line_pix)
+		return NULL;
+
+	// Save current PSM
+	int saved_psm = TessBaseAPIGetPageSegMode(ctx->api);
+
+	// Set PSM 7 for single line recognition
+	TessBaseAPISetPageSegMode(ctx->api, 7); // PSM_SINGLE_LINE
+
+	// Perform OCR
+	TessBaseAPISetImage2(ctx->api, line_pix);
+	BOOL ret = TessBaseAPIRecognize(ctx->api, NULL);
+
+	char *text = NULL;
+	if (!ret)
+	{
+		char *tess_text = TessBaseAPIGetUTF8Text(ctx->api);
+		if (tess_text)
+		{
+			text = strdup(tess_text);
+			TessDeleteText(tess_text);
+		}
+	}
+
+	// Restore original PSM
+	TessBaseAPISetPageSegMode(ctx->api, saved_psm);
+
+	return text;
 }
 
 void debug_tesseract(struct ocrCtx *ctx, char *dump_path)
@@ -243,23 +537,23 @@ void debug_tesseract(struct ocrCtx *ctx, char *dump_path)
 	PIXA *pixa = NULL;
 
 	pix = TessBaseAPIGetInputImage(ctx->api);
-	sprintf(str, "%sinput_%d.jpg", dump_path, i);
+	snprintf(str, sizeof(str), "%sinput_%d.jpg", dump_path, i);
 	pixWrite(str, pix, IFF_JFIF_JPEG);
 
 	pix = TessBaseAPIGetThresholdedImage(ctx->api);
-	sprintf(str, "%sthresholded_%d.jpg", dump_path, i);
+	snprintf(str, sizeof(str), "%sthresholded_%d.jpg", dump_path, i);
 	pixWrite(str, pix, IFF_JFIF_JPEG);
 
 	TessBaseAPIGetRegions(ctx->api, &pixa);
-	sprintf(str, "%sregion_%d", dump_path, i);
+	snprintf(str, sizeof(str), "%sregion_%d", dump_path, i);
 	pixaWriteFiles(str, pixa, IFF_JFIF_JPEG);
 
 	TessBaseAPIGetTextlines(ctx->api, &pixa, NULL);
-	sprintf(str, "%slines_%d", dump_path, i);
+	snprintf(str, sizeof(str), "%slines_%d", dump_path, i);
 	pixaWriteFiles(str, pixa, IFF_JFIF_JPEG);
 
 	TessBaseAPIGetWords(ctx->api, &pixa);
-	sprintf(str, "%swords_%d", dump_path, i);
+	snprintf(str, sizeof(str), "%swords_%d", dump_path, i);
 	pixaWriteFiles(str, pixa, IFF_JFIF_JPEG);
 
 	i++;
@@ -280,10 +574,16 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 	unsigned int *data, *ppixel;
 	BOOL tess_ret = FALSE;
 	struct ocrCtx *ctx = arg;
+	char *combined_text = NULL; // Used by line-split mode
+	size_t combined_len = 0;    // Used by line-split mode
 	pix = pixCreate(w, h, 32);
 	color_pix = pixCreate(w, h, 32);
 	if (pix == NULL || color_pix == NULL)
 	{
+		if (pix)
+			pixDestroy(&pix);
+		if (color_pix)
+			pixDestroy(&color_pix);
 		return NULL;
 	}
 	wpl = pixGetWpl(pix);
@@ -330,45 +630,199 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 	// Converting image to grayscale for OCR to avoid issues with transparency
 	cpix_gs = pixConvertRGBToGray(cpix, 0.0, 0.0, 0.0);
 
+	// Invert the grayscale image for better OCR accuracy
+	// DVB subtitles typically have light text on dark background, but
+	// Tesseract expects dark text on light background
+	if (cpix_gs != NULL)
+		pixInvert(cpix_gs, cpix_gs);
+
+	// Note: Upscaling was removed - testing showed it degrades OCR quality for DVB subtitles
+	// The original bitmap quality (e.g., 520x84) is sufficient for Tesseract
+
 	if (cpix_gs == NULL)
-		tess_ret = -1;
-	else
 	{
-		TessBaseAPISetImage2(ctx->api, cpix_gs);
-		tess_ret = TessBaseAPIRecognize(ctx->api, NULL);
-		debug_tesseract(ctx, "./temp/");
-		if (tess_ret)
+		// Grayscale conversion failed (likely due to invalid/corrupt bitmap data)
+		// Skip this bitmap instead of crashing - this can happen with
+		// corrupted DVB subtitle packets or live stream discontinuities
+		mprint("\nIn ocr_bitmap: Failed to convert bitmap to grayscale. Skipped.\n");
+
+		boxDestroy(&crop_points);
+		pixDestroy(&pix);
+		pixDestroy(&cpix);
+		pixDestroy(&color_pix);
+		pixDestroy(&color_pix_out);
+
+		return NULL;
+	}
+
+	// Line splitting mode: detect lines and OCR each separately with PSM 7
+	if (ccx_options.ocr_line_split && h > 30)
+	{
+		struct line_bounds *lines = NULL;
+		int num_lines = 0;
+
+		// Use min_gap of 3 rows to detect line boundaries
+		if (detect_text_lines(alpha, indata, w, h, &lines, &num_lines, 3) == 0 && num_lines > 1)
 		{
-			mprint("\nIn ocr_bitmap: Failed to perform OCR. Skipped.\n");
+			// Multiple lines detected - process each separately with PSM 7
+			// (combined_text and combined_len are declared at function scope)
 
-			pixDestroy(&pix);
-			pixDestroy(&cpix);
-			pixDestroy(&cpix_gs);
-			pixDestroy(&color_pix);
-			pixDestroy(&color_pix_out);
+			for (int line_idx = 0; line_idx < num_lines; line_idx++)
+			{
+				int line_h = lines[line_idx].end_y - lines[line_idx].start_y + 1;
+				if (line_h <= 0)
+					continue;
 
-			return NULL;
+				// Extract line region from the grayscale image
+				BOX *line_box = boxCreate(0, lines[line_idx].start_y,
+							  pixGetWidth(cpix_gs), line_h);
+				PIX *line_pix_raw = pixClipRectangle(cpix_gs, line_box, NULL);
+				boxDestroy(&line_box);
+
+				if (line_pix_raw)
+				{
+					// Add white padding around the line (helps Tesseract with edge characters)
+					// The image is inverted (dark text on light bg), so add white (255) border
+					int padding = 10;
+					PIX *line_pix = pixAddBorderGeneral(line_pix_raw, padding, padding, padding, padding, 255);
+					pixDestroy(&line_pix_raw);
+					if (!line_pix)
+						continue;
+					char *line_text = ocr_single_line(ctx, line_pix);
+					pixDestroy(&line_pix);
+
+					if (line_text)
+					{
+						// Trim trailing whitespace from line
+						size_t line_len = strlen(line_text);
+						while (line_len > 0 && (line_text[line_len - 1] == '\n' ||
+									line_text[line_len - 1] == '\r' ||
+									line_text[line_len - 1] == ' '))
+						{
+							line_text[--line_len] = '\0';
+						}
+
+						if (line_len > 0)
+						{
+							// Append to combined result
+							size_t new_len = combined_len + line_len + 2; // +1 for newline, +1 for null
+							char *new_combined = (char *)realloc(combined_text, new_len);
+							if (new_combined)
+							{
+								combined_text = new_combined;
+								if (combined_len > 0)
+								{
+									combined_text[combined_len++] = '\n';
+								}
+								strcpy(combined_text + combined_len, line_text);
+								combined_len += line_len;
+							}
+						}
+						free(line_text);
+					}
+				}
+			}
+
+			free(lines);
+
+			if (combined_text && combined_len > 0)
+			{
+				// Successfully processed lines - skip whole-image OCR
+				// but continue to color detection below
+				goto line_split_color_detection;
+			}
+
+			// If we got here, line splitting didn't produce results
+			// Fall through to whole-image OCR
+			if (combined_text)
+				free(combined_text);
+			combined_text = NULL;
 		}
+		else
+		{
+			// Line detection failed or only 1 line - fall through to whole-image OCR
+			if (lines)
+				free(lines);
+		}
+	}
+
+	// Standard whole-image OCR path
+	TessBaseAPISetImage2(ctx->api, cpix_gs);
+	tess_ret = TessBaseAPIRecognize(ctx->api, NULL);
+	debug_tesseract(ctx, "./temp/");
+	if (tess_ret)
+	{
+		mprint("\nIn ocr_bitmap: Failed to perform OCR. Skipped.\n");
+
+		boxDestroy(&crop_points);
+		pixDestroy(&pix);
+		pixDestroy(&cpix);
+		pixDestroy(&cpix_gs);
+		pixDestroy(&color_pix);
+		pixDestroy(&color_pix_out);
+
+		return NULL;
 	}
 
 	char *text_out_from_tes = TessBaseAPIGetUTF8Text(ctx->api);
 	if (text_out_from_tes == NULL)
-		fatal(CCX_COMMON_EXIT_BUG_BUG, "In ocr_bitmap: Failed to perform OCR - Failed to get text. Please report.\n", errno);
+	{
+		// OCR succeeded but no text was recognized - this is not a fatal error,
+		// it just means the bitmap didn't contain recognizable text
+		mprint("\nIn ocr_bitmap: OCR returned no text. Skipped.\n");
+
+		boxDestroy(&crop_points);
+		pixDestroy(&pix);
+		pixDestroy(&cpix);
+		pixDestroy(&cpix_gs);
+		pixDestroy(&color_pix);
+		pixDestroy(&color_pix_out);
+
+		return NULL;
+	}
 	// Make a copy and get rid of the one from Tesseract since we're going to be operating on it
 	// and using it directly causes new/free() warnings.
 	char *text_out = strdup(text_out_from_tes);
 	TessDeleteText(text_out_from_tes);
+	if (!text_out)
+	{
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_bitmap: Out of memory allocating text_out.");
+	}
+
+	// Jump target for line-split mode: use combined_text and continue with color detection
+	if (0)
+	{
+	line_split_color_detection:
+		text_out = combined_text;
+		combined_text = NULL; // Transfer ownership
+	}
 
 	// Begin color detection
-	// Using tlt_config.nofontcolor (true when "--nofontcolor" parameter used) to skip color detection if not required
+	// Using tlt_config.nofontcolor or ccx_options.nofontcolor (true when "--no-fontcolor" parameter used) to skip color detection if not required
+	// This is also skipped if --no-spupngocr is set since the OCR output won't be used anyway
 	int text_out_len;
-	if ((text_out_len = strlen(text_out)) > 0 && !tlt_config.nofontcolor)
+	if ((text_out_len = strlen(text_out)) > 0 && !tlt_config.nofontcolor && !ccx_options.nofontcolor)
 	{
 		float h0 = -100;
 		int written_tag = 0;
 		TessResultIterator *ri = 0;
 		TessPageIteratorLevel level = RIL_WORD;
-		TessBaseAPISetImage2(ctx->api, color_pix_out);
+		PIX *color_pix_processed = NULL; // Will hold preprocessed image for cleanup
+
+		// Preprocess color_pix_out for Tesseract the same way as cpix_gs
+		// Tesseract expects dark text on light background, but DVB subtitles typically
+		// have light text on dark background. Without preprocessing, Tesseract
+		// produces garbage results or crashes when iterating over words.
+		color_pix_processed = pixConvertRGBToGray(color_pix_out, 0.0, 0.0, 0.0);
+		if (color_pix_processed == NULL)
+		{
+			goto skip_color_detection;
+		}
+		pixInvert(color_pix_processed, color_pix_processed);
+
+		// Note: Upscaling removed from color detection pass as well
+
+		TessBaseAPISetImage2(ctx->api, color_pix_processed);
 		tess_ret = TessBaseAPIRecognize(ctx->api, NULL);
 		if (tess_ret != 0)
 		{
@@ -381,13 +835,26 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 
 		if (!tess_ret && ri != 0)
 		{
+			int iteration_count = 0;
+			const int max_iterations = 10000; // Safety limit to prevent infinite loops
 			do
 			{
+				// Safety check: limit iterations to prevent crashes on malformed data
+				if (++iteration_count > max_iterations)
+				{
+					mprint("Warning: OCR color detection exceeded maximum iterations, skipping.\n");
+					break;
+				}
+
 				char *word = TessResultIteratorGetUTF8Text(ri, level);
 				// float conf = TessResultIteratorConfidence(ri,level);
 				int x1, y1, x2, y2;
 				if (!TessPageIteratorBoundingBox((TessPageIterator *)ri, level, &x1, &y1, &x2, &y2))
+				{
+					if (word)
+						TessDeleteText(word);
 					continue;
+				}
 				// printf("word: '%s';  \tconf: %.2f; BoundingBox: %d,%d,%d,%d;",word, conf, x1, y1, x2, y2);
 				// printf("word: '%s';", word);
 				// {
@@ -404,8 +871,23 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 				int max_color = 2;
 
 				histogram = (uint32_t *)malloc(copy->nb_colors * sizeof(uint32_t));
+				if (!histogram)
+				{
+					fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_bitmap: Out of memory allocating histogram.");
+				}
 				iot = (uint8_t *)malloc(copy->nb_colors * sizeof(uint8_t));
+				if (!iot)
+				{
+					free(histogram);
+					fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_bitmap: Out of memory allocating iot.");
+				}
 				mcit = (uint32_t *)malloc(copy->nb_colors * sizeof(uint32_t));
+				if (!mcit)
+				{
+					free(histogram);
+					free(iot);
+					fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_bitmap: Out of memory allocating mcit.");
+				}
 				struct transIntensity ti = {copy->alpha, copy->palette};
 				memset(histogram, 0, copy->nb_colors * sizeof(uint32_t));
 
@@ -418,12 +900,42 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 
 				/* calculate histogram of image */
 				int firstpixel = copy->data[0]; // TODO: Verify this border pixel assumption holds
+
+				// Bounds check: validate bounding box coordinates
+				// The bounding box (x1,y1,x2,y2) is relative to the cropped image.
+				// With crop offset (x,y), the original coordinates are (x+x1, y+y1) to (x+x2, y+y2).
+				// Ensure we don't access outside the original image bounds.
+				int orig_x1 = x + x1;
+				int orig_y1 = y + y1;
+				int orig_x2 = x + x2;
+				int orig_y2 = y + y2;
+
+				if (orig_x1 < 0 || orig_y1 < 0 || orig_x2 >= w || orig_y2 >= h ||
+				    orig_x1 > orig_x2 || orig_y1 > orig_y2)
+				{
+					// Invalid bounding box - skip this word
+					freep(&histogram);
+					freep(&mcit);
+					freep(&iot);
+					if (word)
+						TessDeleteText(word);
+					continue;
+				}
+
 				for (int i = y1; i <= y2; i++)
 				{
 					for (int j = x1; j <= x2; j++)
 					{
-						if (copy->data[(y + i) * w + (x + j)] != firstpixel)
-							histogram[copy->data[(y + i) * w + (x + j)]]++;
+						int idx = (y + i) * w + (x + j);
+						if (idx >= 0 && idx < w * h)
+						{
+							int color_idx = copy->data[idx];
+							if (color_idx >= 0 && color_idx < copy->nb_colors)
+							{
+								if (color_idx != firstpixel)
+									histogram[color_idx]++;
+							}
+						}
 					}
 				}
 				/* sorted in increasing order of intensity */
@@ -553,11 +1065,16 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 						{
 							int index = pos - text_out;
 							// Insert `<font>` tag into `text_out` at the location of `word`/`pos`
-							text_out = realloc(text_out, text_out_len + substr_len + 1);
-							// Save the value is that is going to get overwritten by `sprintf`
+							char *new_text_out = realloc(text_out, text_out_len + substr_len + 1);
+							if (!new_text_out)
+							{
+								fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_bitmap: Out of memory reallocating text_out.");
+							}
+							text_out = new_text_out;
+							// Save the value is that is going to get overwritten by `snprintf`
 							char replaced_by_null = text_out[index];
 							memmove(text_out + index + substr_len + 1, text_out + index + 1, text_out_len - index);
-							sprintf(text_out + index, substr_format, r_avg, g_avg, b_avg);
+							snprintf(text_out + index, substr_len + 1, substr_format, r_avg, g_avg, b_avg);
 							text_out[index + substr_len] = replaced_by_null;
 							text_out_len += substr_len;
 							written_tag = 1;
@@ -565,10 +1082,15 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 						else if (!written_tag)
 						{
 							// Insert `substr` at the beginning of `text_out`
-							text_out = realloc(text_out, text_out_len + substr_len + 1);
+							char *new_text_out = realloc(text_out, text_out_len + substr_len + 1);
+							if (!new_text_out)
+							{
+								fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_bitmap: Out of memory reallocating text_out.");
+							}
+							text_out = new_text_out;
 							char replaced_by_null = *text_out;
 							memmove(text_out + substr_len + 1, text_out + 1, text_out_len);
-							sprintf(text_out, substr_format, r_avg, g_avg, b_avg);
+							snprintf(text_out, substr_len + 1, substr_format, r_avg, g_avg, b_avg);
 							text_out[substr_len] = replaced_by_null;
 							text_out_len += substr_len;
 							written_tag = 1;
@@ -594,6 +1116,10 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 				char *line_start = text_out;
 				int length = strlen(text_out) + length_closing_font * 10; // usually enough
 				char *new_text_out = malloc(length);
+				if (!new_text_out)
+				{
+					fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_bitmap: Out of memory allocating new_text_out.");
+				}
 				char *new_text_out_iter = new_text_out;
 
 				char *last_valid_char = text_out; // last character that is not '\n' or '\0'
@@ -629,7 +1155,13 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 
 						length = max(length * 1.5, length_needed);
 						long diff = new_text_out_iter - new_text_out;
-						new_text_out = realloc(new_text_out, length);
+						char *tmp = realloc(new_text_out, length);
+						if (!tmp)
+						{
+							free(new_text_out);
+							fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_bitmap: Out of memory reallocating new_text_out.");
+						}
+						new_text_out = tmp;
 						new_text_out_iter = new_text_out + diff;
 					}
 
@@ -684,7 +1216,11 @@ char *ocr_bitmap(void *arg, png_color *palette, png_byte *alpha, unsigned char *
 				text_out = new_text_out;
 			}
 		}
-		TessResultIteratorDelete(ri);
+	skip_color_detection:
+		if (ri)
+			TessResultIteratorDelete(ri);
+		if (color_pix_processed)
+			pixDestroy(&color_pix_processed);
 	}
 	// End Color Detection
 	boxDestroy(&crop_points);
@@ -896,22 +1432,46 @@ int ocr_rect(void *arg, struct cc_bitmap *rect, char **str, int bgcolor, int ocr
 
 	struct image_copy *copy;
 	copy = (struct image_copy *)malloc(sizeof(struct image_copy));
+	if (!copy)
+	{
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_rect: Out of memory allocating copy.");
+	}
 	copy->nb_colors = rect->nb_colors;
-	copy->palette = (png_color *)malloc(rect->nb_colors * sizeof(png_color));
-	copy->alpha = (png_byte *)malloc(rect->nb_colors * sizeof(png_byte));
 	copy->bgcolor = bgcolor;
+	copy->data = NULL;    // Initialize to NULL in case of early goto end
+	copy->palette = NULL; // Initialize to NULL for safe cleanup
+	copy->alpha = NULL;   // Initialize to NULL for safe cleanup
+
+	copy->palette = (png_color *)malloc(rect->nb_colors * sizeof(png_color));
+	if (!copy->palette)
+	{
+		free(copy);
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_rect: Out of memory allocating copy->palette.");
+	}
+	copy->alpha = (png_byte *)malloc(rect->nb_colors * sizeof(png_byte));
+	if (!copy->alpha)
+	{
+		free(copy->palette);
+		free(copy);
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_rect: Out of memory allocating copy->alpha.");
+	}
 
 	palette = (png_color *)malloc(rect->nb_colors * sizeof(png_color));
-	if (!palette || !copy->palette)
+	if (!palette)
 	{
-		ret = -1;
-		goto end;
+		free(copy->alpha);
+		free(copy->palette);
+		free(copy);
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_rect: Out of memory allocating palette.");
 	}
 	alpha = (png_byte *)malloc(rect->nb_colors * sizeof(png_byte));
-	if (!alpha || !copy->alpha)
+	if (!alpha)
 	{
-		ret = -1;
-		goto end;
+		free(palette);
+		free(copy->alpha);
+		free(copy->palette);
+		free(copy);
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_rect: Out of memory allocating alpha.");
 	}
 
 	mapclut_paletee(palette, alpha, (uint32_t *)rect->data1, rect->nb_colors);
@@ -929,6 +1489,15 @@ int ocr_rect(void *arg, struct cc_bitmap *rect, char **str, int bgcolor, int ocr
 	}
 
 	copy->data = (unsigned char *)malloc(sizeof(unsigned char) * size);
+	if (!copy->data)
+	{
+		free(alpha);
+		free(palette);
+		free(copy->alpha);
+		free(copy->palette);
+		free(copy);
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In ocr_rect: Out of memory allocating copy->data.");
+	}
 	for (int i = 0; i < size; i++)
 	{
 		copy->data[i] = rect->data0[i];
@@ -1066,7 +1635,9 @@ char *paraof_ocrtext(struct cc_subtitle *sub, struct encoder_ctx *context)
 	{
 		str = malloc(len + 1 + 10); // Extra space for possible trailing '/n's at the end of tesseract UTF8 text
 		if (!str)
-			return NULL;
+		{
+			fatal(EXIT_NOT_ENOUGH_MEMORY, "In paraof_ocrtext: Out of memory allocating str.");
+		}
 		*str = '\0';
 	}
 

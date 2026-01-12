@@ -5,13 +5,25 @@ use std::path::PathBuf;
 fn main() {
     let mut allowlist_functions = Vec::new();
     allowlist_functions.extend_from_slice(&[
-        ".*(?i)_?dtvcc_.*",
+        // Match both lowercase (dtvcc_*) and uppercase (DTVCC_*) patterns
+        ".*_?[Dd][Tt][Vv][Cc][Cc]_.*",
         "get_visible_.*",
         "get_fts",
         "printdata",
         "writercwtdata",
         "version",
         "set_binary_mode",
+        "print_file_report",
+        "ccx_probe_mxf", // shall be removed after mxf
+        "ccx_mxf_init",  // shall be removed after mxf
+        "ccx_gxf_probe", // shall be removed after gxf
+        "ccx_gxf_init",  // shall be removed after gxf
+        #[cfg(windows)]
+        "_open_osfhandle",
+        #[cfg(windows)]
+        "_get_osfhandle",
+        #[cfg(feature = "enable_ffmpeg")]
+        "init_ffmpeg",
         "net_send_header", // shall be removed after NET
         "process_hdcc",
         "anchor_hdcc",
@@ -33,9 +45,12 @@ fn main() {
 
     let mut allowlist_types = Vec::new();
     allowlist_types.extend_from_slice(&[
-        ".*(?i)_?dtvcc_.*",
+        // Match both lowercase (dtvcc_*) and uppercase (DTVCC_*) patterns
+        ".*_?[Dd][Tt][Vv][Cc][Cc]_.*",
         "encoder_ctx",
         "lib_cc_decode",
+        "ccx_demuxer",
+        "lib_ccx_ctx",
         "bitstream",
         "cc_subtitle",
         "ccx_output_format",
@@ -48,6 +63,9 @@ fn main() {
         "ccx_encoding_type",
         "ccx_decoder_608_settings",
         "ccx_decoder_608_report",
+        "ccx_gxf",
+        "MXFContext",
+        "demuxer_data",
         "eia608_screen",
         "uint8_t",
         "word_list",
@@ -66,7 +84,12 @@ fn main() {
     {
         builder = builder.clang_arg("-DENABLE_HARDSUBX");
 
-        // Add FFmpeg include paths for Mac
+        // Check FFMPEG_INCLUDE_DIR environment variable (works on all platforms)
+        if let Ok(ffmpeg_include) = env::var("FFMPEG_INCLUDE_DIR") {
+            builder = builder.clang_arg(format!("-I{}", ffmpeg_include));
+        }
+
+        // Add FFmpeg include paths for Mac (Homebrew)
         if cfg!(target_os = "macos") {
             // Try common Homebrew paths
             if std::path::Path::new("/opt/homebrew/include").exists() {
@@ -80,29 +103,30 @@ fn main() {
             if std::path::Path::new(cellar_ffmpeg).exists() {
                 // Find the FFmpeg version directory
                 if let Ok(entries) = std::fs::read_dir(cellar_ffmpeg) {
-                    for entry in entries {
-                        if let Ok(entry) = entry {
-                            let include_path = entry.path().join("include");
-                            if include_path.exists() {
-                                builder =
-                                    builder.clang_arg(format!("-I{}", include_path.display()));
-                                break;
-                            }
+                    for entry in entries.flatten() {
+                        let include_path = entry.path().join("include");
+                        if include_path.exists() {
+                            builder = builder.clang_arg(format!("-I{}", include_path.display()));
+                            break;
                         }
                     }
                 }
             }
+        }
 
-            // Also check environment variable
-            if let Ok(ffmpeg_include) = env::var("FFMPEG_INCLUDE_DIR") {
-                builder = builder.clang_arg(format!("-I{}", ffmpeg_include));
+        // On Linux, try pkg-config to find FFmpeg include paths
+        if cfg!(target_os = "linux") {
+            if let Ok(lib) = pkg_config::Config::new().probe("libavcodec") {
+                for path in lib.include_paths {
+                    builder = builder.clang_arg(format!("-I{}", path.display()));
+                }
             }
         }
     }
 
     // Tell cargo to invalidate the built crate whenever any of the
     // included header files changed.
-    builder = builder.parse_callbacks(Box::new(bindgen::CargoCallbacks));
+    builder = builder.parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
 
     for type_name in allowlist_types {
         builder = builder.allowlist_type(type_name);

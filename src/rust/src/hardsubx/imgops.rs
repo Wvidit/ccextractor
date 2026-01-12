@@ -1,16 +1,28 @@
 use palette::{FromColor, Hsv, Lab, LinSrgb};
 
+/// Convert RGB values to HSV color space.
+///
+/// # Safety
+///
+/// - `H`, `S`, `V` must be valid mutable references to f32 values
+/// - The references must remain valid for the duration of the function call
 #[no_mangle]
 pub extern "C" fn rgb_to_hsv(R: f32, G: f32, B: f32, H: &mut f32, S: &mut f32, V: &mut f32) {
     let rgb = LinSrgb::new(R, G, B);
 
     let hsv_rep = Hsv::from_color(rgb);
 
-    *H = hsv_rep.hue.to_positive_degrees();
+    *H = hsv_rep.hue.into_positive_degrees();
     *S = hsv_rep.saturation;
     *V = hsv_rep.value;
 }
 
+/// Convert RGB values to Lab color space.
+///
+/// # Safety
+///
+/// - `L`, `a`, `b` must be valid mutable references to f32 values
+/// - The references must remain valid for the duration of the function call
 #[no_mangle]
 pub extern "C" fn rgb_to_lab(R: f32, G: f32, B: f32, L: &mut f32, a: &mut f32, b: &mut f32) {
     // Normalize input RGB from 0-255 to 0.0-1.0

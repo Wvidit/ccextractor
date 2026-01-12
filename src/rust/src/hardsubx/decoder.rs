@@ -4,7 +4,6 @@ use leptonica_sys::*;
 // #[cfg(feature = "hardsubx_ocr")]
 // use rsmpeg::*;
 
-use std::convert::TryInto;
 use std::eprintln;
 use std::ffi;
 use std::format;
@@ -33,6 +32,18 @@ static HARDSUBX_OCRMODE_WORD: i32 = 1;
 //     HARDSUBX_OCRMODE_LETTER
 // };
 
+/// Helper function to convert a Rust-allocated C string to an owned String
+/// Takes ownership of the memory and frees it properly
+unsafe fn cstring_to_owned(ptr: *mut c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    match ffi::CString::from_raw(ptr).into_string() {
+        Ok(s) => s,
+        Err(_) => String::new(),
+    }
+}
+
 /// # Safety
 /// dereferences a raw pointer
 /// calls functions that are not necessarily safe
@@ -41,29 +52,15 @@ pub unsafe fn dispatch_classifier_functions(ctx: *mut lib_hardsubx_ctx, im: *mut
     match (*ctx).ocr_mode {
         0 => {
             let ret_char_arr = get_ocr_text_simple_threshold(ctx, im, (*ctx).conf_thresh);
-            let text_out_result = ffi::CString::from_raw(ret_char_arr).into_string();
-            match text_out_result {
-                Ok(T) => T,
-                Err(_E) => "".to_string(),
-            }
+            cstring_to_owned(ret_char_arr)
         }
         1 => {
             let ret_char_arr = get_ocr_text_wordwise_threshold(ctx, im, (*ctx).conf_thresh);
-            if ret_char_arr.is_null() {
-                "".to_string()
-            } else {
-                ffi::CStr::from_ptr(ret_char_arr)
-                    .to_string_lossy()
-                    .into_owned()
-            }
+            cstring_to_owned(ret_char_arr)
         }
         2 => {
             let ret_char_arr = get_ocr_text_letterwise_threshold(ctx, im, (*ctx).conf_thresh);
-            let text_out_result = ffi::CString::from_raw(ret_char_arr).into_string();
-            match text_out_result {
-                Ok(T) => T,
-                Err(_E) => "".to_string(),
-            }
+            cstring_to_owned(ret_char_arr)
         }
 
         _ => {
@@ -92,7 +89,7 @@ pub unsafe extern "C" fn _process_frame_white_basic(
 
     for i in (3 * height / 4)..height {
         for j in 0..width {
-            let p: isize = (j * 3 + i * frame_deref.linesize[0]).try_into().unwrap();
+            let p: isize = (j * 3 + i * frame_deref.linesize[0]) as isize;
             let r: i32 = (*(frame_deref.data[0]).offset(p)).into();
             let g: i32 = (*(frame_deref.data[0]).offset(p + 1)).into();
             let b: i32 = (*(frame_deref.data[0]).offset(p + 2)).into();
@@ -113,8 +110,7 @@ pub unsafe extern "C" fn _process_frame_white_basic(
     }
 
     let mut gray_im: *mut Pix = pixConvertRGBToGray(im, 0.0, 0.0, 0.0);
-    let mut sobel_edge_im: *mut Pix =
-        pixSobelEdgeFilter(gray_im, L_VERTICAL_EDGES.try_into().unwrap());
+    let mut sobel_edge_im: *mut Pix = pixSobelEdgeFilter(gray_im, L_VERTICAL_EDGES as i32);
     let mut dilate_gray_im: *mut Pix = pixDilateGray(sobel_edge_im, 21, 11);
     let mut edge_im: *mut Pix = pixThresholdToBinary(dilate_gray_im, 50);
 
@@ -172,7 +168,7 @@ pub unsafe extern "C" fn _process_frame_color_basic(
 
     for i in 0..height {
         for j in 0..width {
-            let p: isize = (j * 3 + i * frame_deref.linesize[0]).try_into().unwrap();
+            let p: isize = (j * 3 + i * frame_deref.linesize[0]) as isize;
             let r: i32 = (*(frame_deref.data[0]).offset(p)).into();
             let g: i32 = (*(frame_deref.data[0]).offset(p + 1)).into();
             let b: i32 = (*(frame_deref.data[0]).offset(p + 2)).into();
@@ -191,8 +187,7 @@ pub unsafe extern "C" fn _process_frame_color_basic(
     }
 
     let mut gray_im: *mut Pix = pixConvertRGBToGray(im, 0.0, 0.0, 0.0);
-    let mut sobel_edge_im: *mut Pix =
-        pixSobelEdgeFilter(gray_im, L_VERTICAL_EDGES.try_into().unwrap());
+    let mut sobel_edge_im: *mut Pix = pixSobelEdgeFilter(gray_im, L_VERTICAL_EDGES as i32);
     let mut dilate_gray_im: *mut Pix = pixDilateGray(sobel_edge_im, 21, 1);
     let mut edge_im: *mut Pix = pixThresholdToBinary(dilate_gray_im, 50);
 
@@ -268,7 +263,7 @@ pub unsafe extern "C" fn _process_frame_tickertext(
 
     for i in ((92 * height) / 100)..height {
         for j in 0..width {
-            let p: isize = (j * 3 + i * frame_deref.linesize[0]).try_into().unwrap();
+            let p: isize = (j * 3 + i * frame_deref.linesize[0]) as isize;
             let r: i32 = (*(frame_deref.data[0]).offset(p)).into();
             let g: i32 = (*(frame_deref.data[0]).offset(p + 1)).into();
             let b: i32 = (*(frame_deref.data[0]).offset(p + 2)).into();
@@ -289,8 +284,7 @@ pub unsafe extern "C" fn _process_frame_tickertext(
     }
 
     let mut gray_im: *mut Pix = pixConvertRGBToGray(im, 0.0, 0.0, 0.0);
-    let mut sobel_edge_im: *mut Pix =
-        pixSobelEdgeFilter(gray_im, L_VERTICAL_EDGES.try_into().unwrap());
+    let mut sobel_edge_im: *mut Pix = pixSobelEdgeFilter(gray_im, L_VERTICAL_EDGES as i32);
     let mut dilate_gray_im: *mut Pix = pixDilateGray(sobel_edge_im, 21, 11);
     let mut edge_im: *mut Pix = pixThresholdToBinary(dilate_gray_im, 50);
 
@@ -316,12 +310,12 @@ pub unsafe extern "C" fn _process_frame_tickertext(
 
     let write_path: String = format!("./lum_im{}.jpg", index);
     let write_path_c: *mut c_char = string_to_c_char(&write_path);
-    pixWrite(write_path_c, lum_im, IFF_JFIF_JPEG.try_into().unwrap());
+    pixWrite(write_path_c, lum_im, IFF_JFIF_JPEG as i32);
     let _dealloc = std::ffi::CString::from_raw(write_path_c); // for memory reasons
 
     let write_path: String = format!("./im{}.jpg", index);
     let write_path_c: *mut c_char = string_to_c_char(&write_path);
-    pixWrite(write_path_c, lum_im, IFF_JFIF_JPEG.try_into().unwrap());
+    pixWrite(write_path_c, lum_im, IFF_JFIF_JPEG as i32);
     let _dealloc = std::ffi::CString::from_raw(write_path_c); // for memory reasons
 
     pixDestroy(&mut im as *mut *mut Pix);

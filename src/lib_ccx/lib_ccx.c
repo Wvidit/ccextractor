@@ -12,7 +12,7 @@ static struct ccx_decoders_common_settings_t *init_decoder_setting(
 {
 	struct ccx_decoders_common_settings_t *setting;
 
-	setting = malloc(sizeof(struct ccx_decoders_common_settings_t));
+	setting = calloc(1, sizeof(struct ccx_decoders_common_settings_t));
 	if (!setting)
 		return NULL;
 
@@ -33,6 +33,7 @@ static struct ccx_decoders_common_settings_t *init_decoder_setting(
 	setting->hauppauge_mode = opt->hauppauge_mode;
 	setting->xds_write_to_file = opt->transcript_settings.xds;
 	setting->ocr_quantmode = opt->ocr_quantmode;
+	// program_number, codec, and private_data are zero-initialized by calloc
 
 	return setting;
 }
@@ -114,12 +115,12 @@ struct lib_ccx_ctx *init_libraries(struct ccx_s_options *opt)
 		ctx->eit_programs = (struct EIT_program *)malloc(sizeof(struct EIT_program) * (TS_PMT_MAP_SIZE + 1));
 		ctx->eit_current_events = (int32_t *)malloc(sizeof(int32_t) * (TS_PMT_MAP_SIZE + 1));
 		ctx->ATSC_source_pg_map = (int16_t *)malloc(sizeof(int16_t) * (0xffff));
+		if (!ctx->epg_buffers || !ctx->eit_programs || !ctx->eit_current_events || !ctx->ATSC_source_pg_map)
+			ccx_common_logging.fatal_ftn(EXIT_NOT_ENOUGH_MEMORY, "lib_ccx_ctx");
 		memset(ctx->epg_buffers, 0, sizeof(struct PSI_buffer) * (0xfff + 1));
 		memset(ctx->eit_programs, 0, sizeof(struct EIT_program) * (TS_PMT_MAP_SIZE + 1));
 		memset(ctx->eit_current_events, 0, sizeof(int32_t) * (TS_PMT_MAP_SIZE + 1));
 		memset(ctx->ATSC_source_pg_map, 0, sizeof(int16_t) * (0xffff));
-		if (!ctx->epg_buffers || !ctx->eit_programs || !ctx->eit_current_events || !ctx->ATSC_source_pg_map)
-			ccx_common_logging.fatal_ftn(EXIT_NOT_ENOUGH_MEMORY, "lib_ccx_ctx");
 	}
 	else
 	{
@@ -149,7 +150,10 @@ struct lib_ccx_ctx *init_libraries(struct ccx_s_options *opt)
 	ctx->dec_global_setting = init_decoder_setting(opt);
 	if (!ctx->dec_global_setting)
 	{
+		free(report_608);
 		free(report_dtvcc);
+		EPG_free(ctx);
+		free(ctx);
 		return NULL;
 	}
 
@@ -173,6 +177,8 @@ struct lib_ccx_ctx *init_libraries(struct ccx_s_options *opt)
 	ctx->subs_delay = opt->subs_delay;
 
 	ctx->pesheaderbuf = (unsigned char *)malloc(188); // Never larger anyway
+	if (!ctx->pesheaderbuf)
+		ccx_common_logging.fatal_ftn(EXIT_NOT_ENOUGH_MEMORY, "init_libraries: Not enough memory allocating pesheaderbuf");
 
 	ctx->cc_to_stdout = opt->cc_to_stdout;
 	ctx->pes_header_to_stdout = opt->pes_header_to_stdout;
@@ -199,6 +205,10 @@ struct lib_ccx_ctx *init_libraries(struct ccx_s_options *opt)
 end:
 	if (ret != EXIT_OK)
 	{
+		dinit_decoder_setting(&ctx->dec_global_setting);
+		free(ctx->freport.data_from_608);
+		free(ctx->freport.data_from_708);
+		EPG_free(ctx);
 		free(ctx);
 		return NULL;
 	}
@@ -215,6 +225,7 @@ void dinit_libraries(struct lib_ccx_ctx **ctx)
 	list_for_each_entry_safe(dec_ctx, dec_ctx1, &lctx->dec_ctx_head, list, struct lib_cc_decode)
 	{
 		LLONG cfts;
+		void *saved_private_data = dec_ctx->private_data; // Save before close NULLs it
 		if (dec_ctx->codec == CCX_CODEC_DVB)
 			dvbsub_close_decoder(&dec_ctx->private_data);
 		// Test memory for teletext
@@ -222,6 +233,18 @@ void dinit_libraries(struct lib_ccx_ctx **ctx)
 			telxcc_close(&dec_ctx->private_data, &dec_ctx->dec_sub);
 		else if (dec_ctx->codec == CCX_CODEC_ISDB_CC)
 			delete_isdb_decoder(&dec_ctx->private_data);
+
+		// Also NULL out any cinfo entries that shared this private_data pointer
+		// to prevent double-free in dinit_cap
+		if (saved_private_data && lctx->demux_ctx)
+		{
+			struct cap_info *cinfo_iter;
+			list_for_each_entry(cinfo_iter, &lctx->demux_ctx->cinfo_tree.all_stream, all_stream, struct cap_info)
+			{
+				if (cinfo_iter->codec_private_data == saved_private_data)
+					cinfo_iter->codec_private_data = NULL;
+			}
+		}
 
 		flush_cc_decode(dec_ctx, &dec_ctx->dec_sub);
 		cfts = get_fts(dec_ctx->timing, dec_ctx->current_field);
@@ -258,13 +281,31 @@ void dinit_libraries(struct lib_ccx_ctx **ctx)
 int is_decoder_processed_enough(struct lib_ccx_ctx *ctx)
 {
 	struct lib_cc_decode *dec_ctx;
-	list_for_each_entry(dec_ctx, &ctx->dec_ctx_head, list, struct lib_cc_decode)
-	{
-		if (dec_ctx->processed_enough == CCX_TRUE && ctx->multiprogram == CCX_FALSE)
-			return CCX_TRUE;
-	}
 
-	return CCX_FALSE;
+	// If the decoder list is empty, no user-defined limits could have been reached
+	if (list_empty(&ctx->dec_ctx_head))
+		return CCX_FALSE;
+
+	if (ctx->multiprogram == CCX_FALSE)
+	{
+		// In single-program mode, return TRUE if ANY decoder has processed enough
+		list_for_each_entry(dec_ctx, &ctx->dec_ctx_head, list, struct lib_cc_decode)
+		{
+			if (dec_ctx->processed_enough == CCX_TRUE)
+				return CCX_TRUE;
+		}
+		return CCX_FALSE;
+	}
+	else
+	{
+		// In multiprogram mode, return TRUE only if ALL decoders have processed enough
+		list_for_each_entry(dec_ctx, &ctx->dec_ctx_head, list, struct lib_cc_decode)
+		{
+			if (dec_ctx->processed_enough == CCX_FALSE)
+				return CCX_FALSE;
+		}
+		return CCX_TRUE;
+	}
 }
 struct lib_cc_decode *update_decoder_list(struct lib_ccx_ctx *ctx)
 {
@@ -290,6 +331,8 @@ struct lib_cc_decode *update_decoder_list(struct lib_ccx_ctx *ctx)
 		{
 			dec_ctx->prev = malloc(sizeof(struct lib_cc_decode));
 			dec_ctx->dec_sub.prev = malloc(sizeof(struct cc_subtitle));
+			if (!dec_ctx->prev || !dec_ctx->dec_sub.prev)
+				ccx_common_logging.fatal_ftn(EXIT_NOT_ENOUGH_MEMORY, "update_decoder_list: Not enough memory for DVB context");
 			memset(dec_ctx->dec_sub.prev, 0, sizeof(struct cc_subtitle));
 		}
 	}
@@ -303,7 +346,14 @@ struct lib_cc_decode *update_decoder_list_cinfo(struct lib_ccx_ctx *ctx, struct 
 	list_for_each_entry(dec_ctx, &ctx->dec_ctx_head, list, struct lib_cc_decode)
 	{
 		if (!cinfo || ctx->multiprogram == CCX_FALSE)
+		{
+			/* Update private_data from cinfo if available.
+			   This is needed after PAT changes when dinit_cap() freed the old context
+			   and a new cap_info was created with a new codec_private_data. */
+			if (cinfo && cinfo->codec_private_data)
+				dec_ctx->private_data = cinfo->codec_private_data;
 			return dec_ctx;
+		}
 
 		if (dec_ctx->program_number == cinfo->program_number)
 			return dec_ctx;
@@ -380,14 +430,17 @@ struct encoder_ctx *update_encoder_list_cinfo(struct lib_ccx_ctx *ctx, struct ca
 	{
 		if (ctx->out_interval != -1)
 		{
-			int len;
-
-			len = strlen(ctx->basefilename) + 10 + strlen(extension);
+			// Format: "%s_%06d%s" needs: basefilename + '_' + up to 10 digits + extension + null
+			size_t len = strlen(ctx->basefilename) + 1 + 10 + strlen(extension) + 1;
 
 			freep(&ccx_options.enc_cfg.output_filename);
 			ccx_options.enc_cfg.output_filename = malloc(len);
+			if (!ccx_options.enc_cfg.output_filename)
+			{
+				return NULL;
+			}
 
-			sprintf(ccx_options.enc_cfg.output_filename, "%s_%06d%s", ctx->basefilename, ctx->segment_counter + 1, extension);
+			snprintf(ccx_options.enc_cfg.output_filename, len, "%s_%06d%s", ctx->basefilename, ctx->segment_counter + 1, extension);
 		}
 		if (list_empty(&ctx->enc_ctx_head))
 		{
@@ -401,9 +454,8 @@ struct encoder_ctx *update_encoder_list_cinfo(struct lib_ccx_ctx *ctx, struct ca
 	}
 	else
 	{
-		int len;
-
-		len = strlen(ctx->basefilename) + 10 + strlen(extension);
+		// Format: "%s_%d%s" needs: basefilename + '_' + up to 10 digits + extension + null
+		size_t len = strlen(ctx->basefilename) + 1 + 10 + strlen(extension) + 1;
 
 		ccx_options.enc_cfg.program_number = pn;
 		ccx_options.enc_cfg.output_filename = malloc(len);
@@ -412,7 +464,7 @@ struct encoder_ctx *update_encoder_list_cinfo(struct lib_ccx_ctx *ctx, struct ca
 			return NULL;
 		}
 
-		sprintf(ccx_options.enc_cfg.output_filename, "%s_%d%s", ctx->basefilename, pn, extension);
+		snprintf(ccx_options.enc_cfg.output_filename, len, "%s_%d%s", ctx->basefilename, pn, extension);
 		enc_ctx = init_encoder(&ccx_options.enc_cfg);
 		if (!enc_ctx)
 		{

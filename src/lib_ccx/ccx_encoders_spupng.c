@@ -67,17 +67,21 @@ struct spupng_t *spunpg_init(struct ccx_s_write *out)
 		ccx_common_logging.fatal_ftn(CCX_COMMON_EXIT_FILE_CREATION_FAILED, "Cannot open %s: %s\n",
 					     out->filename, strerror(errno));
 	}
+	size_t filename_len = strlen(out->filename);
 	sp->dirname = (char *)malloc(
-	    sizeof(char) * (strlen(out->filename) + 3));
+	    sizeof(char) * (filename_len + 3));
 	if (NULL == sp->dirname)
 		ccx_common_logging.fatal_ftn(EXIT_NOT_ENOUGH_MEMORY, "spunpg_init: Memory allocation failed (sp->dirname)");
 
-	strcpy(sp->dirname, out->filename);
+	memcpy(sp->dirname, out->filename, filename_len + 1);
 	char *p = strrchr(sp->dirname, '.');
 	if (NULL == p)
 		p = sp->dirname + strlen(sp->dirname);
 	*p = '\0';
-	strcat(sp->dirname, ".d");
+	// Buffer size is filename_len + 3, current length is at most filename_len, appending ".d" (2 chars)
+	size_t current_len = strlen(sp->dirname);
+	size_t remaining = filename_len + 3 - current_len;
+	strncat(sp->dirname, ".d", remaining - 1);
 	if (0 != mkdir(sp->dirname, 0777))
 	{
 		if (errno != EEXIST)
@@ -90,22 +94,23 @@ struct spupng_t *spunpg_init(struct ccx_s_write *out)
 	}
 
 	// enough to append /subNNNN.png
-	sp->pngfile = (char *)malloc(sizeof(char) * (strlen(sp->dirname) + 13));
-	sp->relative_path_png = (char *)malloc(sizeof(char) * (strlen(sp->dirname) + 13));
+	size_t pngfile_size = strlen(sp->dirname) + 13;
+	sp->pngfile = (char *)malloc(sizeof(char) * pngfile_size);
+	sp->relative_path_png = (char *)malloc(sizeof(char) * pngfile_size);
 
 	if (NULL == sp->pngfile || NULL == sp->relative_path_png)
 		ccx_common_logging.fatal_ftn(EXIT_NOT_ENOUGH_MEMORY, "spunpg_init: Memory allocation failed (sp->pngfile)");
 	sp->fileIndex = 0;
-	sprintf(sp->pngfile, "%s/sub%04d.png", sp->dirname, sp->fileIndex);
+	snprintf(sp->pngfile, pngfile_size, "%s/sub%04d.png", sp->dirname, sp->fileIndex);
 
 	// Make relative path
 	char *last_slash = strrchr(sp->dirname, '/');
 	if (last_slash == NULL)
 		last_slash = strrchr(sp->dirname, '\\');
 	if (last_slash != NULL)
-		sprintf(sp->relative_path_png, "%s/sub%04d.png", last_slash + 1, sp->fileIndex);
+		snprintf(sp->relative_path_png, pngfile_size, "%s/sub%04d.png", last_slash + 1, sp->fileIndex);
 	else // do NOT do sp->relative_path_png = sp->pngfile (to avoid double free).
-		strcpy(sp->relative_path_png, sp->pngfile);
+		memcpy(sp->relative_path_png, sp->pngfile, strlen(sp->pngfile) + 1);
 
 	// For NTSC closed captions and 720x480 DVD subtitle resolution:
 	// Each character is 16x26.
@@ -186,7 +191,38 @@ void write_sputag_close(struct spupng_t *sp)
 }
 void write_spucomment(struct spupng_t *sp, const char *str)
 {
-	fprintf(sp->fpxml, "<!--\n%s\n-->\n", str);
+	fprintf(sp->fpxml, "<!--\n");
+
+	const char *p = str;
+	const char *last_safe_pos = str; // Track the last safe position to flush
+
+	while (*p)
+	{
+
+		if (*p == '-' && *(p + 1) == '-')
+		{
+
+			if (p > last_safe_pos)
+			{
+				fwrite(last_safe_pos, 1, p - last_safe_pos, sp->fpxml);
+			}
+
+			fputc('-', sp->fpxml);
+			p += 2;
+			last_safe_pos = p;
+		}
+		else
+		{
+			p++;
+		}
+	}
+
+	if (p > last_safe_pos)
+	{
+		fwrite(last_safe_pos, 1, p - last_safe_pos, sp->fpxml);
+	}
+
+	fprintf(sp->fpxml, "\n-->\n");
 }
 
 char *get_spupng_filename(void *ctx)
@@ -197,16 +233,17 @@ char *get_spupng_filename(void *ctx)
 void inc_spupng_fileindex(struct spupng_t *sp)
 {
 	sp->fileIndex++;
-	sprintf(sp->pngfile, "%s/sub%04d.png", sp->dirname, sp->fileIndex);
+	size_t pngfile_size = strlen(sp->dirname) + 13;
+	snprintf(sp->pngfile, pngfile_size, "%s/sub%04d.png", sp->dirname, sp->fileIndex);
 
 	// Make relative path
 	char *last_slash = strrchr(sp->dirname, '/');
 	if (last_slash == NULL)
 		last_slash = strrchr(sp->dirname, '\\');
 	if (last_slash != NULL)
-		sprintf(sp->relative_path_png, "%s/sub%04d.png", last_slash + 1, sp->fileIndex);
+		snprintf(sp->relative_path_png, pngfile_size, "%s/sub%04d.png", last_slash + 1, sp->fileIndex);
 	else // do NOT do sp->relative_path_png = sp->pngfile (to avoid double free).
-		strcpy(sp->relative_path_png, sp->pngfile);
+		memcpy(sp->relative_path_png, sp->pngfile, strlen(sp->pngfile) + 1);
 }
 void set_spupng_offset(void *ctx, int x, int y)
 {
@@ -214,6 +251,9 @@ void set_spupng_offset(void *ctx, int x, int y)
 	sp->xOffset = x;
 	sp->yOffset = y;
 }
+
+// Forward declaration for calculate_spupng_offsets
+static void calculate_spupng_offsets(struct spupng_t *sp, struct encoder_ctx *ctx);
 int save_spupng(const char *filename, uint8_t *bitmap, int w, int h,
 		png_color *palette, png_byte *alpha, int nb_color)
 {
@@ -347,7 +387,7 @@ int write_cc_bitmap_as_spupng(struct cc_subtitle *sub, struct encoder_ctx *conte
 	struct cc_bitmap *rect;
 	png_color *palette = NULL;
 	png_byte *alpha = NULL;
-	int wrote_opentag = 1;
+	int wrote_opentag = 0; // Track if we actually wrote the tag
 
 	x_pos = -1;
 	y_pos = -1;
@@ -358,13 +398,11 @@ int write_cc_bitmap_as_spupng(struct cc_subtitle *sub, struct encoder_ctx *conte
 		return 0;
 
 	inc_spupng_fileindex(sp);
-	write_sputag_open(sp, sub->start_time, sub->end_time - 1);
 
 	if (sub->nb_data == 0 && (sub->flags & SUB_EOD_MARKER))
 	{
 		context->prev_start = -1;
-		if (wrote_opentag)
-			write_sputag_close(sp);
+		// No subtitle data, skip writing
 		return 0;
 	}
 	rect = sub->data;
@@ -403,10 +441,20 @@ int write_cc_bitmap_as_spupng(struct cc_subtitle *sub, struct encoder_ctx *conte
 		}
 	}
 	filename = get_spupng_filename(sp);
-	set_spupng_offset(sp, x_pos, y_pos);
+
+	// Set image dimensions for offset calculation
+	sp->img_w = width;
+	sp->img_h = height;
+
+	// Calculate centered offsets based on screen size (PAL/NTSC)
+	calculate_spupng_offsets(sp, context);
 	if (sub->flags & SUB_EOD_MARKER)
 		context->prev_start = sub->start_time;
 	pbuf = (uint8_t *)malloc(width * height);
+	if (!pbuf)
+	{
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In write_cc_bitmap_as_spupng: Out of memory allocating pbuf.");
+	}
 	memset(pbuf, 0x0, width * height);
 
 	for (i = 0; i < sub->nb_data; i++)
@@ -434,6 +482,15 @@ int write_cc_bitmap_as_spupng(struct cc_subtitle *sub, struct encoder_ctx *conte
 
 	/* TODO do rectangle wise, one color table should not be used for all rectangles */
 	mapclut_paletee(palette, alpha, (uint32_t *)rect[0].data1, rect[0].nb_colors);
+
+	// Save PNG file first
+	save_spupng(filename, pbuf, width, height, palette, alpha, rect[0].nb_colors);
+	freep(&pbuf);
+
+	// Write XML tag with calculated centered offsets
+	write_sputag_open(sp, sub->start_time, sub->end_time - 1);
+	wrote_opentag = 1; // Mark that we wrote the tag
+
 #ifdef ENABLE_OCR
 	if (!context->nospupngocr)
 	{
@@ -446,8 +503,6 @@ int write_cc_bitmap_as_spupng(struct cc_subtitle *sub, struct encoder_ctx *conte
 		}
 	}
 #endif
-	save_spupng(filename, pbuf, width, height, palette, alpha, rect[0].nb_colors);
-	freep(&pbuf);
 
 end:
 	if (wrote_opentag)
@@ -504,6 +559,12 @@ int write_image(struct pixel_t *buffer, FILE *fp, int width, int height)
 
 	// Allocate memory for one row (4 bytes per pixel - RGBA)
 	row = (png_bytep)malloc(4 * width * sizeof(png_byte));
+	if (!row)
+	{
+		mprint("\nFailed to allocate memory for row in write_image.\n");
+		ret_code = 0;
+		goto finalise;
+	}
 
 	// Write image data
 	int x, y;
@@ -523,10 +584,8 @@ int write_image(struct pixel_t *buffer, FILE *fp, int width, int height)
 	png_write_end(png_ptr, NULL);
 
 finalise:
-	if (info_ptr != NULL)
-		png_free_data(png_ptr, info_ptr, PNG_FREE_ALL, -1);
 	if (png_ptr != NULL)
-		png_destroy_write_struct(&png_ptr, (png_infopp)NULL);
+		png_destroy_write_struct(&png_ptr, &info_ptr);
 	if (row != NULL)
 		free(row);
 
@@ -574,6 +633,10 @@ void center_justify(struct pixel_t *target, int target_w,
 	// Note that the copy is smaller than the line:
 	//   its width is set to just enough to contain the valid area
 	struct pixel_t *temp_buffer = malloc(valid_w * valid_h * sizeof(struct pixel_t));
+	if (!temp_buffer)
+	{
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In center_justify: Out of memory allocating temp_buffer.");
+	}
 
 	// x,y here is input-based (i.e. `buffer`)
 	for (int x = 0; x < valid_w; ++x)
@@ -677,6 +740,10 @@ uint32_t *utf8_to_utf32(char *src)
 	len_dst = (len_src + 2) * 4; // one for FEFF and one for \0
 
 	uint32_t *string_utf32 = (uint32_t *)calloc(len_dst, 1);
+	if (!string_utf32)
+	{
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In utf8_to_utf32: Out of memory allocating string_utf32.");
+	}
 	size_t inbufbytesleft = len_src;
 	size_t outbufbytesleft = len_dst;
 	char *inbuf = src;
@@ -731,8 +798,8 @@ int spupng_export_string2png(struct spupng_t *sp, char *str, FILE *output)
 	struct pixel_t *buffer = malloc(canvas_width * canvas_height * sizeof(struct pixel_t));
 	if (buffer == NULL)
 	{
-		mprint("\nFailed to alloc memory for buffer. Need %d bytes.\n",
-		       canvas_width * canvas_height * sizeof(struct pixel_t));
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "In spupng_export_string2png: Out of memory allocating buffer. Need %lu bytes.",
+		      (unsigned long)(canvas_width * canvas_height * sizeof(struct pixel_t)));
 	}
 	memset(buffer, 0, canvas_width * canvas_height * sizeof(struct pixel_t));
 
@@ -740,7 +807,10 @@ int spupng_export_string2png(struct spupng_t *sp, char *str, FILE *output)
 	char *tmp = strdup(str);
 
 	if (!tmp)
+	{
+		free(buffer);
 		return -1;
+	}
 
 	char *token = strtok(tmp, "<>");
 
@@ -849,9 +919,11 @@ int spupng_export_string2png(struct spupng_t *sp, char *str, FILE *output)
 				struct pixel_t *new_buffer = realloc(buffer, canvas_width * canvas_height * sizeof(struct pixel_t));
 				if (new_buffer == NULL)
 				{
-					mprint("\nFailed to alloc memory for buffer. Need %d bytes.\n",
-					       canvas_width * canvas_height * sizeof(struct pixel_t));
-					return 0;
+					free(buffer);
+					free(tmp);
+					free(string_utf32);
+					fatal(EXIT_NOT_ENOUGH_MEMORY, "In spupng_export_string2png: Out of memory expanding buffer. Need %lu bytes.",
+					      (unsigned long)(canvas_width * canvas_height * sizeof(struct pixel_t)));
 				}
 				memset(new_buffer + old_height * canvas_width, 0, (canvas_height - old_height) * canvas_width * sizeof(struct pixel_t));
 				buffer = new_buffer;
@@ -933,6 +1005,8 @@ int spupng_export_string2png(struct spupng_t *sp, char *str, FILE *output)
 	*/
 
 	// Save image
+	sp->img_w = canvas_width;
+	sp->img_h = canvas_height;
 	write_image(buffer, output, canvas_width, canvas_height);
 	free(tmp);
 	free(buffer);
@@ -944,11 +1018,13 @@ int spupng_export_string2png(struct spupng_t *sp, char *str, FILE *output)
 // Convert EIA608 Data(buffer) to string
 // out must have at least 256 characters' space
 // Return value is the length of the output string
+#define EIA608_OUT_SIZE 256
 int eia608_to_str(struct encoder_ctx *context, struct eia608_screen *data, char *out)
 {
 
 	int str_len = 0;
 	int first = 1;
+	out[0] = '\0'; // Initialize output buffer
 	for (int row = 0; row < ROWS; row++)
 	{
 		if (data->row_used[row])
@@ -997,11 +1073,22 @@ int eia608_to_str(struct encoder_ctx *context, struct eia608_screen *data, char 
 
 			if (!first)
 			{ // Add '\n' if it is not the first line.
-				strcat(out, "\n");
-				str_len += 2;
+				if (str_len + 1 < EIA608_OUT_SIZE)
+				{
+					out[str_len++] = '\n';
+					out[str_len] = '\0';
+				}
+				str_len++; // Count the newline even if truncated (for return value)
 			}
 			first = 0;
-			strncat(out, start, len);
+			// Copy at most what fits in remaining buffer
+			size_t remaining = (str_len < EIA608_OUT_SIZE - 1) ? (EIA608_OUT_SIZE - 1 - str_len) : 0;
+			size_t to_copy = (len < remaining) ? len : remaining;
+			if (to_copy > 0)
+			{
+				memcpy(out + str_len, start, to_copy);
+				out[str_len + to_copy] = '\0';
+			}
 			str_len += len;
 		}
 	}
@@ -1010,6 +1097,28 @@ int eia608_to_str(struct encoder_ctx *context, struct eia608_screen *data, char 
 
 // string needs to be in UTF-8 encoding.
 // This function will take care of encoding.
+static void calculate_spupng_offsets(struct spupng_t *sp, struct encoder_ctx *ctx)
+{
+	int screen_w = 720;
+	int screen_h;
+
+	/* Teletext is always PAL */
+	if (ctx->in_fileformat == 2 || ctx->is_pal)
+	{
+		screen_h = 576;
+	}
+	else
+	{
+		screen_h = 480;
+	}
+
+	sp->xOffset = (screen_w - sp->img_w) / 2;
+	sp->yOffset = (screen_h - sp->img_h) / 2;
+
+	// SPU / DVD requires even yOffset (interlacing)
+	if (sp->yOffset & 1)
+		sp->yOffset++;
+}
 int spupng_write_string(struct spupng_t *sp, char *string, LLONG start_time, LLONG end_time,
 			struct encoder_ctx *context)
 {
@@ -1028,6 +1137,7 @@ int spupng_write_string(struct spupng_t *sp, char *string, LLONG start_time, LLO
 	}
 	// free(string_utf32);
 	fclose(sp->fppng);
+	calculate_spupng_offsets(sp, context);
 	write_sputag_open(sp, start_time, end_time);
 	write_spucomment(sp, string);
 	write_sputag_close(sp);

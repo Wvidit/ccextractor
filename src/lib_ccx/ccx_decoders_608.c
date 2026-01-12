@@ -127,6 +127,8 @@ ccx_decoder_608_context *ccx_decoder_608_init_library(struct ccx_decoder_608_set
 	ccx_decoder_608_context *data = NULL;
 
 	data = malloc(sizeof(ccx_decoder_608_context));
+	if (!data)
+		return NULL;
 
 	data->cursor_column = 0;
 	data->cursor_row = 0;
@@ -147,10 +149,11 @@ ccx_decoder_608_context *ccx_decoder_608_init_library(struct ccx_decoder_608_set
 	data->my_field = field;
 	data->my_channel = channel;
 	data->have_cursor_position = 0;
+	data->rollup_from_popon = 0;
 	data->output_format = output_format;
 	data->cc_to_stdout = cc_to_stdout;
 	data->textprinted = 0;
-	data->ts_start_of_current_line = 0;
+	// Note: ts_start_of_current_line already set to -1 above
 
 	data->halt = halt;
 
@@ -198,6 +201,9 @@ void delete_to_end_of_row(ccx_decoder_608_context *context)
 {
 	if (context->mode != MODE_TEXT)
 	{
+		if (context->cursor_row >= CCX_DECODER_608_SCREEN_ROWS)
+			return;
+
 		struct eia608_screen *use_buffer = get_writing_buffer(context);
 		for (int i = context->cursor_column; i <= CCX_DECODER_608_SCREEN_WIDTH - 1; i++)
 		{
@@ -218,6 +224,10 @@ void write_char(const unsigned char c, ccx_decoder_608_context *context)
 		/* printf ("\rWriting char [%c] at %s:%d:%d\n",c,
 		use_buffer == &wb->data608->buffer1?"B1":"B2",
 		wb->data608->cursor_row,wb->data608->cursor_column); */
+
+		if (context->cursor_row >= CCX_DECODER_608_SCREEN_ROWS || context->cursor_column >= CCX_DECODER_608_SCREEN_WIDTH)
+			return;
+
 		use_buffer->characters[context->cursor_row][context->cursor_column] = c;
 		use_buffer->colors[context->cursor_row][context->cursor_column] = context->current_color;
 		use_buffer->fonts[context->cursor_row][context->cursor_column] = context->font;
@@ -225,7 +235,9 @@ void write_char(const unsigned char c, ccx_decoder_608_context *context)
 
 		if (use_buffer->empty)
 		{
-			if (MODE_POPON != context->mode)
+			// Don't set start time if we're in a transition from pop-on to roll-up
+			// In this case, start time will be set when CR causes scrolling
+			if (MODE_POPON != context->mode && !context->rollup_from_popon)
 				context->current_visible_start_ms = get_visible_start(context->timing, context->my_field);
 		}
 		use_buffer->empty = 0;
@@ -311,12 +323,23 @@ int write_cc_buffer(ccx_decoder_608_context *context, struct cc_subtitle *sub)
 
 	if (!data->empty && context->output_format != CCX_OF_NULL)
 	{
-		sub->data = (struct eia608_screen *)realloc(sub->data, (sub->nb_data + 1) * sizeof(*data));
-		if (!sub->data)
+		size_t new_size;
+
+		if (sub->nb_data + 1 > SIZE_MAX / sizeof(struct eia608_screen))
 		{
-			ccx_common_logging.log_ftn("No Memory left");
+			ccx_common_logging.log_ftn("Too many screens, cannot allocate more memory.\n");
 			return 0;
 		}
+
+		new_size = (sub->nb_data + 1) * sizeof(struct eia608_screen);
+
+		struct eia608_screen *new_data = (struct eia608_screen *)realloc(sub->data, new_size);
+		if (!new_data)
+		{
+			ccx_common_logging.log_ftn("Out of memory while reallocating screen buffer\n");
+			return 0;
+		}
+		sub->data = new_data;
 		sub->datatype = CC_DATATYPE_GENERIC;
 		memcpy(((struct eia608_screen *)sub->data) + sub->nb_data, data, sizeof(*data));
 		sub->nb_data++;
@@ -380,12 +403,23 @@ int write_cc_line(ccx_decoder_608_context *context, struct cc_subtitle *sub)
 
 	if (!data->empty)
 	{
-		sub->data = (struct eia608_screen *)realloc(sub->data, (sub->nb_data + 1) * sizeof(*data));
-		if (!sub->data)
+		size_t new_size;
+
+		if (sub->nb_data + 1 > SIZE_MAX / sizeof(struct eia608_screen))
 		{
-			ccx_common_logging.log_ftn("No Memory left");
+			ccx_common_logging.log_ftn("Too many screens, cannot allocate more memory.\n");
 			return 0;
 		}
+
+		new_size = (sub->nb_data + 1) * sizeof(struct eia608_screen);
+
+		struct eia608_screen *new_data = (struct eia608_screen *)realloc(sub->data, new_size);
+		if (!new_data)
+		{
+			ccx_common_logging.log_ftn("Out of memory while reallocating screen buffer\n");
+			return 0;
+		}
+		sub->data = new_data;
 		memcpy(((struct eia608_screen *)sub->data) + sub->nb_data, data, sizeof(*data));
 		data = (struct eia608_screen *)sub->data + sub->nb_data;
 		sub->datatype = CC_DATATYPE_GENERIC;
@@ -720,6 +754,10 @@ void handle_command(unsigned char c1, const unsigned char c2, ccx_decoder_608_co
 				if (write_cc_buffer(context, sub))
 					context->screenfuls_counter++;
 				erase_memory(context, true);
+				// Track transition from pop-on/paint-on to roll-up for timing adjustment
+				// Start time will be set when CR causes scrolling (matching FFmpeg behavior)
+				context->rollup_from_popon = 1;
+				context->ts_start_of_current_line = -1;
 			}
 			erase_memory(context, false);
 
@@ -772,6 +810,15 @@ void handle_command(unsigned char c1, const unsigned char c2, ccx_decoder_608_co
 			changes = check_roll_up(context);
 			if (changes)
 			{
+				// Handle pop-on to roll-up transition timing
+				// Use ts_start_of_current_line (when current line started) as the start time
+				// This matches FFmpeg's behavior of timestamping when the display changed
+				if (context->rollup_from_popon && context->ts_start_of_current_line > 0)
+				{
+					context->current_visible_start_ms = context->ts_start_of_current_line;
+					context->rollup_from_popon = 0;
+				}
+
 				// Only if the roll up would actually cause a line to disappear we write the buffer
 				if (context->output_format != CCX_OF_TRANSCRIPT)
 				{
@@ -781,8 +828,18 @@ void handle_command(unsigned char c1, const unsigned char c2, ccx_decoder_608_co
 						erase_memory(context, true); // Make sure the lines we just wrote aren't written again
 				}
 			}
-			roll_up(context);			// The roll must be done anyway of course.
-			context->ts_start_of_current_line = -1; // Unknown.
+			roll_up(context); // The roll must be done anyway of course.
+			// When in pop-on to roll-up transition with changes=0 (first CR, only 1 line),
+			// preserve the CR time so the next caption uses the display state change time,
+			// not the character typing time. This matches FFmpeg's timing behavior.
+			if (context->rollup_from_popon && !changes)
+			{
+				context->ts_start_of_current_line = get_fts(context->timing, context->my_field);
+			}
+			else
+			{
+				context->ts_start_of_current_line = -1; // Unknown.
+			}
 			if (changes)
 				context->current_visible_start_ms = get_visible_start(context->timing, context->my_field);
 			context->cursor_column = 0;

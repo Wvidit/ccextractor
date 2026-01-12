@@ -6,6 +6,7 @@
 #include "dvb_subtitle_decoder.h"
 #include "ccx_decoders_isdb.h"
 #include "file_buffer.h"
+#include <inttypes.h>
 
 #ifdef DEBUG_SAVE_TS_PACKETS
 #include <sys/types.h>
@@ -35,6 +36,10 @@ char *get_buffer_type_str(struct cap_info *cinfo)
 	else if (cinfo->stream == CCX_STREAM_TYPE_VIDEO_H264)
 	{
 		return strdup("H.264");
+	}
+	else if (cinfo->stream == CCX_STREAM_TYPE_VIDEO_HEVC)
+	{
+		return strdup("HEVC");
 	}
 	else if (cinfo->stream == CCX_STREAM_TYPE_PRIVATE_MPEG2 && cinfo->codec == CCX_CODEC_ISDB_CC)
 	{
@@ -129,6 +134,10 @@ enum ccx_bufferdata_type get_buffer_type(struct cap_info *cinfo)
 	{
 		return CCX_H264;
 	}
+	else if (cinfo->stream == CCX_STREAM_TYPE_VIDEO_HEVC)
+	{
+		return CCX_HEVC;
+	}
 	else if (cinfo->stream == CCX_STREAM_TYPE_PRIVATE_MPEG2 && cinfo->codec == CCX_CODEC_DVB)
 	{
 		return CCX_DVB_SUBTITLE;
@@ -145,12 +154,11 @@ enum ccx_bufferdata_type get_buffer_type(struct cap_info *cinfo)
 	{
 		return CCX_TELETEXT;
 	}
-	else if (cinfo->stream == CCX_STREAM_TYPE_PRIVATE_MPEG2 && cinfo->codec == CCX_CODEC_ATSC_CC)
+	else if ((cinfo->stream == CCX_STREAM_TYPE_PRIVATE_MPEG2 ||
+		  cinfo->stream == CCX_STREAM_TYPE_PRIVATE_USER_MPEG2) &&
+		 cinfo->codec == CCX_CODEC_ATSC_CC)
 	{
-		return CCX_PRIVATE_MPEG2_CC;
-	}
-	else if (cinfo->stream == CCX_STREAM_TYPE_PRIVATE_USER_MPEG2 && cinfo->codec == CCX_CODEC_ATSC_CC)
-	{
+		// ATSC CC can be in either private stream type - process both as PES
 		return CCX_PES;
 	}
 	else
@@ -174,6 +182,7 @@ void init_ts(struct ccx_demuxer *ctx)
 	desc[CCX_STREAM_TYPE_AUDIO_AAC] = "AAC audio";
 	desc[CCX_STREAM_TYPE_VIDEO_MPEG4] = "MPEG-4 video";
 	desc[CCX_STREAM_TYPE_VIDEO_H264] = "H.264 video";
+	desc[CCX_STREAM_TYPE_VIDEO_HEVC] = "HEVC video";
 	desc[CCX_STREAM_TYPE_PRIVATE_USER_MPEG2] = "MPEG-2 User Private";
 	desc[CCX_STREAM_TYPE_AUDIO_AC3] = "AC3 audio";
 	desc[CCX_STREAM_TYPE_AUDIO_DTS] = "DTS audio";
@@ -270,7 +279,7 @@ int ts_readpacket(struct ccx_demuxer *ctx, struct ts_payload *payload)
 	FILE *savepacket;
 	pid_t mypid = getpid();
 	char spfn[1024];
-	sprintf(spfn, "/tmp/packets_%u.ts", (unsigned)mypid);
+	snprintf(spfn, sizeof(spfn), "/tmp/packets_%u.ts", (unsigned)mypid);
 	savepacket = fopen(spfn, "ab");
 	if (savepacket)
 	{
@@ -352,12 +361,82 @@ void look_for_caption_data(struct ccx_demuxer *ctx, struct ts_payload *payload)
 	if (payload->length < 4 || ctx->PIDs_seen[payload->pid] == 3) // Second thing means we already inspected this PID
 		return;
 
+	// Check for PES header to detect video streams (no PAT/PMT mode)
+	if (payload->pesstart && payload->length >= 9)
+	{
+		// Check for PES start code (00 00 01)
+		if (payload->start[0] == 0x00 && payload->start[1] == 0x00 && payload->start[2] == 0x01)
+		{
+			unsigned char stream_id = payload->start[3];
+			// Video stream IDs are 0xE0-0xEF
+			if (stream_id >= 0xE0 && stream_id <= 0xEF)
+			{
+				// This is a video stream - check if we need to register it
+				struct cap_info *cinfo = get_cinfo(ctx, payload->pid);
+				if (cinfo == NULL)
+				{
+					// Not registered yet - determine video type from elementary stream
+					// Look for MPEG-2 sequence header (00 00 01 B3) or H.264 NAL unit
+					unsigned char pes_header_len = 0;
+					if (payload->length > 8)
+						pes_header_len = payload->start[8];
+
+					unsigned int es_start = 9 + pes_header_len;
+					if (es_start + 4 < payload->length)
+					{
+						unsigned char *es_data = payload->start + es_start;
+						enum ccx_stream_type stream_type = CCX_STREAM_TYPE_VIDEO_MPEG2; // Default to MPEG-2
+
+						// Check for H.264/H.265 NAL start codes
+						if (es_data[0] == 0x00 && es_data[1] == 0x00 && es_data[2] == 0x00 && es_data[3] == 0x01)
+						{
+							// Check for H.264 NAL types first (1-byte header, type in bits 4:0)
+							unsigned char h264_nal_type = es_data[4] & 0x1F;
+							if (h264_nal_type == 7 || h264_nal_type == 8) // H.264 SPS or PPS
+								stream_type = CCX_STREAM_TYPE_VIDEO_H264;
+							else
+							{
+								// Check for HEVC NAL types (2-byte header, type in bits 6:1 of first byte)
+								unsigned char hevc_nal_type = (es_data[4] >> 1) & 0x3F;
+								// HEVC VPS=32, SPS=33, PPS=34, PREFIX_SEI=39, SUFFIX_SEI=40
+								// Also check for IDR (19, 20) and CRA (21) which are common first NALs
+								if (hevc_nal_type == 32 || hevc_nal_type == 33 || hevc_nal_type == 34 ||
+								    hevc_nal_type == 39 || hevc_nal_type == 40 ||
+								    hevc_nal_type == 19 || hevc_nal_type == 20 || hevc_nal_type == 21)
+									stream_type = CCX_STREAM_TYPE_VIDEO_HEVC;
+							}
+						}
+
+						mprint("PID %u detected as video stream (no PAT/PMT) - assuming %s.\n",
+						       payload->pid,
+						       stream_type == CCX_STREAM_TYPE_VIDEO_H264 ? "H.264" : (stream_type == CCX_STREAM_TYPE_VIDEO_HEVC ? "HEVC" : "MPEG-2"));
+
+						// Register this PID as a video stream that may contain captions
+						update_capinfo(ctx, payload->pid, stream_type, CCX_CODEC_ATSC_CC, 0, NULL);
+						ctx->PIDs_seen[payload->pid] = 3;
+						return;
+					}
+				}
+			}
+		}
+	}
+
+	// Look for GA94 caption marker
 	for (i = 0; i < (payload->length - 3); i++)
 	{
 		if (payload->start[i] == 'G' && payload->start[i + 1] == 'A' &&
 		    payload->start[i + 2] == '9' && payload->start[i + 3] == '4')
 		{
 			mprint("PID %u seems to contain CEA-608 captions.\n", payload->pid);
+
+			// Register this PID if not already registered (no PAT/PMT mode)
+			struct cap_info *cinfo = get_cinfo(ctx, payload->pid);
+			if (cinfo == NULL)
+			{
+				mprint("Registering PID %u as MPEG-2 video with captions (no PAT/PMT detected).\n", payload->pid);
+				update_capinfo(ctx, payload->pid, CCX_STREAM_TYPE_VIDEO_MPEG2, CCX_CODEC_ATSC_CC, 0, NULL);
+			}
+
 			ctx->PIDs_seen[payload->pid] = 3;
 			return;
 		}
@@ -488,17 +567,15 @@ int copy_capbuf_demux_data(struct ccx_demuxer *ctx, struct demuxer_data **data, 
 	if (!cinfo->capbuf || !cinfo->capbuflen)
 		return -1;
 
-	if (ptr->bufferdatatype == CCX_PRIVATE_MPEG2_CC)
-	{
-		dump(CCX_DMT_GENERIC_NOTICES, cinfo->capbuf, cinfo->capbuflen, 0, 1);
-		// Bogus data, so we return something
-		ptr->buffer[ptr->len++] = 0xFA;
-		ptr->buffer[ptr->len++] = 0x80;
-		ptr->buffer[ptr->len++] = 0x80;
-		return CCX_OK;
-	}
 	if (cinfo->codec == CCX_CODEC_TELETEXT)
 	{
+		if (cinfo->capbuflen > BUFSIZE - ptr->len)
+		{
+			fatal(CCX_COMMON_EXIT_BUG_BUG,
+			      "Teletext packet (%" PRId64 ") larger than remaining buffer (%" PRId64 ").\n",
+			      cinfo->capbuflen, (int64_t)(BUFSIZE - ptr->len));
+		}
+
 		memcpy(ptr->buffer + ptr->len, cinfo->capbuf, cinfo->capbuflen);
 		ptr->len += cinfo->capbuflen;
 		return CCX_OK;
@@ -510,8 +587,11 @@ int copy_capbuf_demux_data(struct ccx_demuxer *ctx, struct demuxer_data **data, 
 	}
 	if (vpesdatalen < 0)
 	{
-		dbg_print(CCX_DMT_VERBOSE, "Seems to be a broken PES. Terminating file handling.\n");
-		return CCX_EOF;
+		// Don't terminate file processing for a single broken PES packet.
+		// Just skip this packet and continue with the next one.
+		// This commonly occurs in UK Freeview DVB recordings.
+		dbg_print(CCX_DMT_VERBOSE, "Skipping broken PES packet (buffer too small or malformed header).\n");
+		return CCX_OK;
 	}
 
 	if (ccx_options.hauppauge_mode)
@@ -590,10 +670,12 @@ void cinfo_cremation(struct ccx_demuxer *ctx, struct demuxer_data **data)
 
 int copy_payload_to_capbuf(struct cap_info *cinfo, struct ts_payload *payload)
 {
-	int newcapbuflen;
 
 	if (cinfo->ignore == CCX_TRUE &&
-	    (cinfo->stream != CCX_STREAM_TYPE_VIDEO_MPEG2 || !ccx_options.analyze_video_stream))
+	    ((cinfo->stream != CCX_STREAM_TYPE_VIDEO_MPEG2 &&
+	      cinfo->stream != CCX_STREAM_TYPE_VIDEO_H264 &&
+	      cinfo->stream != CCX_STREAM_TYPE_VIDEO_HEVC) ||
+	     !ccx_options.analyze_video_stream))
 	{
 		return CCX_OK;
 	}
@@ -613,16 +695,22 @@ int copy_payload_to_capbuf(struct cap_info *cinfo, struct ts_payload *payload)
 	}
 
 	// copy payload to capbuf
-	newcapbuflen = cinfo->capbuflen + payload->length;
-	if (newcapbuflen > cinfo->capbufsize)
+	if (payload->length > INT64_MAX - cinfo->capbuflen)
 	{
-		cinfo->capbuf = (unsigned char *)realloc(cinfo->capbuf, newcapbuflen);
-		if (!cinfo->capbuf)
+		mprint("Error: capbuf size overflow\n");
+		return -1;
+	}
+	int64_t newcapbuflen = (int64_t)cinfo->capbuflen + payload->length;
+	if (newcapbuflen > (int64_t)cinfo->capbufsize)
+	{
+		unsigned char *new_capbuf = (unsigned char *)realloc(cinfo->capbuf, (size_t)newcapbuflen);
+		if (!new_capbuf)
 			return -1;
-		cinfo->capbufsize = newcapbuflen;
+		cinfo->capbuf = new_capbuf;
+		cinfo->capbufsize = newcapbuflen; // Note: capbufsize is int in struct cap_info
 	}
 	memcpy(cinfo->capbuf + cinfo->capbuflen, payload->start, payload->length);
-	cinfo->capbuflen = newcapbuflen;
+	cinfo->capbuflen = newcapbuflen; // Note: capbuflen is int in struct cap_info
 
 	return CCX_OK;
 }
@@ -665,7 +753,10 @@ uint64_t get_pts(uint8_t *buffer)
 	return UINT64_MAX;
 }
 
-long ts_readstream(struct ccx_demuxer *ctx, struct demuxer_data **data)
+// Threshold for enabling packet analysis mode when no PAT is found (in bytes)
+#define NO_PAT_THRESHOLD (188 * 1000) // After ~1000 packets
+
+int64_t ts_readstream(struct ccx_demuxer *ctx, struct demuxer_data **data)
 {
 	int gotpes = 0;
 	long pespcount = 0;	      // count packets in PES with captions
@@ -676,6 +767,7 @@ long ts_readstream(struct ccx_demuxer *ctx, struct demuxer_data **data)
 	struct cap_info *cinfo;
 	struct ts_payload payload;
 	int j;
+	static int no_pat_warning_shown = 0;
 
 	memset(&payload, 0, sizeof(payload));
 
@@ -754,6 +846,19 @@ long ts_readstream(struct ccx_demuxer *ctx, struct demuxer_data **data)
 			continue;
 		}
 
+		// Enable packet analysis mode if no PAT has been found after reading enough data
+		// This handles TS files that don't have PAT/PMT tables (e.g., some DVR recordings)
+		if (ctx->nb_program == 0 && ctx->past > NO_PAT_THRESHOLD && !packet_analysis_mode)
+		{
+			packet_analysis_mode = 1;
+			if (!no_pat_warning_shown)
+			{
+				mprint("\nNo PAT/PMT found after %lld bytes. Enabling packet analysis mode to detect video streams.\n",
+				       ctx->past);
+				no_pat_warning_shown = 1;
+			}
+		}
+
 		switch (ctx->PIDs_seen[payload.pid])
 		{
 			case 0: // First time we see this PID
@@ -828,9 +933,13 @@ long ts_readstream(struct ccx_demuxer *ctx, struct demuxer_data **data)
 			int haup_newcapbuflen = haup_capbuflen + payload.length;
 			if (haup_newcapbuflen > haup_capbufsize)
 			{
-				haup_capbuf = (unsigned char *)realloc(haup_capbuf, haup_newcapbuflen);
-				if (!haup_capbuf)
+				unsigned char *new_haup_capbuf = (unsigned char *)realloc(haup_capbuf, haup_newcapbuflen);
+				if (!new_haup_capbuf)
+				{
+					free(haup_capbuf);
 					fatal(EXIT_NOT_ENOUGH_MEMORY, "Not enough memory to store hauppauge packets");
+				}
+				haup_capbuf = new_haup_capbuf;
 				haup_capbufsize = haup_newcapbuflen;
 			}
 			memcpy(haup_capbuf + haup_capbuflen, payload.start, payload.length);
@@ -858,7 +967,10 @@ long ts_readstream(struct ccx_demuxer *ctx, struct demuxer_data **data)
 			continue;
 		}
 		else if (cinfo->ignore == CCX_TRUE &&
-			 (cinfo->stream != CCX_STREAM_TYPE_VIDEO_MPEG2 || !ccx_options.analyze_video_stream))
+			 ((cinfo->stream != CCX_STREAM_TYPE_VIDEO_MPEG2 &&
+			   cinfo->stream != CCX_STREAM_TYPE_VIDEO_H264 &&
+			   cinfo->stream != CCX_STREAM_TYPE_VIDEO_HEVC) ||
+			  !ccx_options.analyze_video_stream))
 		{
 			if (cinfo->codec_private_data)
 			{

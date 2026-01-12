@@ -121,6 +121,8 @@ int hardsubx_process_data(struct lib_hardsubx_ctx *ctx, struct lib_ccx_ctx *ctx_
 
 	// Free the allocated memory for frame processing
 	av_free(ctx->rgb_buffer);
+	if (ctx->sws_ctx)
+		sws_freeContext(ctx->sws_ctx);
 	if (ctx->frame)
 		av_frame_free(&ctx->frame);
 	if (ctx->rgb_frame)
@@ -244,6 +246,9 @@ struct lib_hardsubx_ctx *_init_hardsubx(struct ccx_s_options *options)
 		if (strcmp(lang, "eng") == 0)
 		{
 			mprint("eng.traineddata not found! No Switching Possible\n");
+			free(pars_vec);
+			free(pars_values);
+			free(ctx);
 			return NULL;
 		}
 		mprint("%s.traineddata not found! Switching to English\n", lang);
@@ -252,6 +257,9 @@ struct lib_hardsubx_ctx *_init_hardsubx(struct ccx_s_options *options)
 		if (!tessdata_path)
 		{
 			mprint("eng.traineddata not found! No Switching Possible\n");
+			free(pars_vec);
+			free(pars_values);
+			free(ctx);
 			return NULL;
 		}
 	}
@@ -277,8 +285,10 @@ struct lib_hardsubx_ctx *_init_hardsubx(struct ccx_s_options *options)
 
 	free(pars_vec);
 	free(pars_values);
+	// Note: tessdata_path points to static string or getenv() result, do NOT free
 	if (ret != 0)
 	{
+		free(ctx);
 		fatal(EXIT_NOT_ENOUGH_MEMORY, "Not enough memory to initialize Tesseract");
 	}
 
@@ -307,6 +317,13 @@ struct lib_hardsubx_ctx *_init_hardsubx(struct ccx_s_options *options)
 
 	// Initialize subtitle structure memory
 	ctx->dec_sub = (struct cc_subtitle *)malloc(sizeof(struct cc_subtitle));
+	if (!ctx->dec_sub)
+	{
+		TessBaseAPIEnd(ctx->tess_handle);
+		TessBaseAPIDelete(ctx->tess_handle);
+		free(ctx);
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "Not enough memory to initialize subtitle structure.");
+	}
 	memset(ctx->dec_sub, 0, sizeof(struct cc_subtitle));
 
 	return ctx;
@@ -321,8 +338,11 @@ void _dinit_hardsubx(struct lib_hardsubx_ctx **ctx)
 	TessBaseAPIEnd(lctx->tess_handle);
 	TessBaseAPIDelete(lctx->tess_handle);
 
+	// Free basefilename (allocated by get_basename in _init_hardsubx)
+	freep(&lctx->basefilename);
+
 	// Free subtitle
-	freep(lctx->dec_sub);
+	freep(&lctx->dec_sub);
 	freep(ctx);
 }
 
@@ -334,6 +354,10 @@ void hardsubx(struct ccx_s_options *options, struct lib_ccx_ctx *ctx_normal)
 	// Initialize HardsubX data structures
 	struct lib_hardsubx_ctx *ctx;
 	ctx = _init_hardsubx(options);
+	if (!ctx)
+	{
+		fatal(EXIT_NOT_ENOUGH_MEMORY, "Failed to initialize HardsubX context.");
+	}
 
 	// Dump parameters (Not using params_dump since completely different parameters)
 	_hardsubx_params_dump(options, ctx);

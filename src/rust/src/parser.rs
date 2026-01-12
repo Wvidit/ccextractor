@@ -238,7 +238,7 @@ impl OptionsExt for Options {
             OutFormat::Ttxt => {
                 self.write_format = OutputFormat::Transcript;
                 if self.date_format == TimestampFormat::None {
-                    self.date_format = TimestampFormat::HHMMSS;
+                    self.date_format = TimestampFormat::HHMMSSFFF;
                 }
                 // Sets the right things so that timestamps and the mode are printed.
                 if !self.transcript_settings.is_final {
@@ -311,6 +311,7 @@ impl OptionsExt for Options {
             InFormat::Mp4 => self.demux_cfg.auto_stream = StreamMode::Mp4,
             InFormat::Mkv => self.demux_cfg.auto_stream = StreamMode::Mkv,
             InFormat::Mxf => self.demux_cfg.auto_stream = StreamMode::Mxf,
+            InFormat::Scc => self.demux_cfg.auto_stream = StreamMode::Scc,
         }
     }
 
@@ -427,31 +428,17 @@ impl OptionsExt for Options {
         }
     }
 
-    fn append_file_to_queue(&mut self, filename: &str, inputfile_capacity: &mut i32) -> i32 {
+    fn append_file_to_queue(&mut self, filename: &str, _inputfile_capacity: &mut i32) -> i32 {
         if filename.is_empty() {
             return 0;
         }
 
-        let num_input_files = if let Some(ref inputfile) = self.inputfile {
-            inputfile.len()
-        } else {
-            0
-        };
-        if num_input_files >= *inputfile_capacity as _ {
-            *inputfile_capacity += 10;
-        }
-
-        let new_size = (*inputfile_capacity).try_into().unwrap_or(0);
-
         if self.inputfile.is_none() {
-            self.inputfile = Some(Vec::with_capacity(new_size));
+            self.inputfile = Some(Vec::new());
         }
 
         if let Some(ref mut inputfile) = self.inputfile {
-            inputfile.resize(new_size, String::new());
-
-            let index = num_input_files;
-            inputfile[index] = filename.to_string();
+            inputfile.push(filename.to_string());
         }
 
         0
@@ -756,11 +743,18 @@ impl OptionsExt for Options {
         }
 
         if let Some(ref lang) = args.dvblang {
-            self.dvblang = Some(Language::from_str(lang.as_str()).unwrap());
+            self.dvblang = Some(Language::from_str(lang.as_str()).unwrap_or_else(|_| {
+                fatal!(
+                    cause = ExitCause::MalformedParameter;
+                    "Invalid dvblang value '{}'. Use a 3-letter ISO 639-2 language code (e.g., 'chi', 'eng', 'chs').",
+                    lang
+                );
+            }));
         }
 
         if let Some(ref ocrlang) = args.ocrlang {
-            self.ocrlang = Some(Language::from_str(ocrlang.as_str()).unwrap());
+            // Accept Tesseract language names directly (e.g., "chi_tra", "chi_sim", "eng")
+            self.ocrlang = Some(ocrlang.clone());
         }
 
         if let Some(ref quant) = args.quant {
@@ -795,6 +789,14 @@ impl OptionsExt for Options {
                 );
             }
             self.psm = *psm as _;
+        }
+
+        if args.ocr_line_split {
+            self.ocr_line_split = true;
+        }
+
+        if args.no_ocr_blacklist {
+            self.ocr_blacklist = false;
         }
 
         if let Some(ref lang) = args.mkvlang {
@@ -872,6 +874,29 @@ impl OptionsExt for Options {
         if args.mpeg90090 {
             set_mpeg_clock_freq(90090);
         }
+
+        // Handle SCC framerate option
+        if let Some(ref fps_str) = args.scc_framerate {
+            self.scc_framerate = match fps_str.as_str() {
+                "29.97" | "29" => 0,
+                "24" => 1,
+                "25" => 2,
+                "30" => 3,
+                _ => {
+                    eprintln!(
+                        "Invalid SCC framerate '{}'. Using default 29.97fps",
+                        fps_str
+                    );
+                    0
+                }
+            };
+        }
+
+        // Handle SCC accurate timing option (issue #1120)
+        if args.scc_accurate_timing {
+            self.scc_accurate_timing = true;
+        }
+
         if args.no_scte20 {
             self.noscte20 = true;
         }
@@ -947,6 +972,10 @@ impl OptionsExt for Options {
         if args.multiprogram {
             self.multiprogram = true;
             self.demux_cfg.ts_allprogram = true;
+        }
+
+        if args.list_tracks {
+            self.list_tracks_only = true;
         }
 
         if let Some(ref stream) = args.stream {
@@ -1204,9 +1233,29 @@ impl OptionsExt for Options {
             }
         }
 
-        if let Some(ref tpage) = args.tpage {
-            tlt_config.user_page = get_atoi_hex::<u16>(tpage.as_str()) as _;
-            tlt_config.page = Cell::new(TeletextPageNumber::from(tlt_config.user_page));
+        if let Some(ref tpages) = args.tpage {
+            // Support multiple --tpage arguments (issue #665)
+            if tpages.len() == 1 {
+                // Single page - legacy mode
+                tlt_config.user_page = tpages[0];
+                tlt_config.page = Cell::new(TeletextPageNumber::from(tlt_config.user_page));
+            } else {
+                // Multiple pages - each gets a separate output file
+                for &page_num in tpages {
+                    if (100..=899).contains(&page_num) {
+                        tlt_config.user_pages.push(page_num);
+                    }
+                }
+                // Set first page as legacy value for backward compatibility
+                if !tlt_config.user_pages.is_empty() {
+                    tlt_config.user_page = tlt_config.user_pages[0];
+                    tlt_config.page = Cell::new(TeletextPageNumber::from(tlt_config.user_page));
+                }
+            }
+        }
+
+        if args.tpages_all {
+            tlt_config.extract_all_pages = true;
         }
 
         // Red Hen/ UCLA Specific stuff
@@ -1226,6 +1275,10 @@ impl OptionsExt for Options {
 
         if args.latrusmap {
             tlt_config.latrusmap = true;
+        }
+
+        if args.ttxtforcelatin {
+            tlt_config.forceg0latin = true;
         }
 
         if args.tickertext {
@@ -1483,6 +1536,15 @@ impl OptionsExt for Options {
                "Teletext page number out of range (100-899)"
             );
         }
+        // Validate multiple pages if specified (issue #665)
+        for page in &tlt_config.user_pages {
+            if *page < 100 || *page > 899 {
+                fatal!(
+                    cause = ExitCause::NotClassified;
+                   "Teletext page number {} out of range (100-899)", page
+                );
+            }
+        }
 
         if self.is_inputfile_empty() && self.input_source == DataSource::File {
             fatal!(
@@ -1647,6 +1709,9 @@ pub mod tests {
         util::{encoding::Encoding, log::DebugMessageFlag},
     };
 
+    /// # Safety
+    ///
+    /// This function is a no-op stub and is always safe to call.
     #[no_mangle]
     pub unsafe extern "C" fn set_binary_mode() {}
 
@@ -1752,10 +1817,10 @@ pub mod tests {
 
         match options.enc_cfg.services_charsets {
             DtvccServiceCharset::None => {
-                assert!(false);
+                unreachable!("Expected DtvccServiceCharset::Unique");
             }
             DtvccServiceCharset::Same(_) => {
-                assert!(false);
+                unreachable!("Expected DtvccServiceCharset::Unique");
             }
             DtvccServiceCharset::Unique(charsets) => {
                 assert_eq!(charsets[1], "UTF-8");
